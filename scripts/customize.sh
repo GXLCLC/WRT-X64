@@ -1,4 +1,11 @@
 #!/bin/bash
+# 拉取 easytier
+rm -rf package/luci-app-easytier
+git clone https://github.com/EasyTier/luci-app-easytier package/luci-app-easytier
+
+#拉取smartdns
+rm -rf package/smartdns
+git clone https://github.com/pymumu/smartdns package/smartdns
 # ======================================================================
 #  OpenWrt 固件自定义脚本（改这一个文件就够了）
 # ----------------------------------------------------------------------
@@ -14,12 +21,6 @@
 #    OpenWrt 首次开机时会自动执行一次它，执行后自动删除。
 #    这是 OpenWrt 官方推荐的"首次启动定制"方式，干净、不碰源码、可移植。
 # ======================================================================
-
-# 拉取 easytier
-git clone https://github.com/EasyTier/luci-app-easytier package/luci-app-easytier
-
-#拉取smartdns
-git clone https://github.com/pymumu/smartdns package/smartdns
 
 
 
