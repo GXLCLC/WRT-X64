@@ -1,7 +1,5 @@
 #!/bin/bash
-# 拉取 easytier
-rm -rf package/luci-app-easytier
-git clone https://github.com/EasyTier/luci-app-easytier package/luci-app-easytier
+
 
 #拉取smartdns
 rm -rf package/smartdns
