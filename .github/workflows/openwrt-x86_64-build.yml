@@ -35,6 +35,7 @@ env:
   CONFIG_FILE: config/x86_64.config                              # 你的自定义配置文件位置
   KENZOK8_FEED: https://github.com/kenzok8/openwrt-packages      # 第三方源(ddnsto 在这里)
   OPENAPPFILTER_URL: https://github.com/destan19/OpenAppFilter   # 应用过滤插件(独立仓库)
+  SMARTDNS_URL: https://github.com/pymumu/smartdns               #Smartdns
   TZ: Asia/Shanghai          # 让日志时间显示北京时间
 
 # 允许本工作流创建 Release（发布固件需要写仓库权限）
