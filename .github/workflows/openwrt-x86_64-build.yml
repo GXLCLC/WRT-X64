@@ -36,6 +36,7 @@ env:
   KENZOK8_FEED: https://github.com/kenzok8/openwrt-packages      # 第三方源(ddnsto 在这里)
   OPENAPPFILTER_URL: https://github.com/destan19/OpenAppFilter   # 应用过滤插件(独立仓库)
   SMARTDNS_URL: https://github.com/pymumu/smartdns               #Smartdns
+  EASYTIER_URL: https://github.com/EasyTier/luci-app-easytier    #内网穿透
   TZ: Asia/Shanghai          # 让日志时间显示北京时间
 
 # 允许本工作流创建 Release（发布固件需要写仓库权限）
@@ -44,18 +45,18 @@ permissions:
 
 jobs:
   build:
-    # ---------- 编译机系统：按要求使用 Ubuntu 22.04 ----------
-    # 注意：GitHub 已宣布 ubuntu-22.04 于 2026-09-17 开始弃用，2027-04-17 完全退役。
-    #       到时候只需把下面一行改成 ubuntu-24.04，其余步骤无需改动。
+ # ---------- 编译机系统：按要求使用 Ubuntu 22.04 ----------
+ # 注意：GitHub 已宣布 ubuntu-22.04 于 2026-09-17 开始弃用，2027-04-17 完全退役。
+ #       到时候只需把下面一行改成 ubuntu-24.04，其余步骤无需改动。
     runs-on: ubuntu-22.04
 
     steps:
-      # ============ 第 1 步：检出本仓库代码 ============
-      # 目的：拿到 config/x86_64.config 自定义配置文件
+ # ============ 第 1 步：检出本仓库代码 ============
+ # 目的：拿到 config/x86_64.config 自定义配置文件
       - name: 检出本仓库代码
         uses: actions/checkout@v4
 
-      # ============ 第 2 步：初始化编译环境 ============
+ # ============ 第 2 步：初始化编译环境 ============
       - name: 初始化编译环境
         env:
           DEBIAN_FRONTEND: noninteractive   # apt 交互提问全部自动应答，避免流程卡住
