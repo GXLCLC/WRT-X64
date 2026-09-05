@@ -64,8 +64,11 @@ uci set network.lan.ipaddr='$LAN_IP'
 uci set network.lan.netmask='$LAN_NETMASK'
 uci commit network
 
-# 设置管理后台默认语言为中文
+# 设置管理后台默认语言
 uci set luci.main.lang='$LANGUAGE'
+# 将 Argon 设为默认主题（注意：光安装主题不会自动启用它，必须写这条才会生效；
+# 若固件里没装 argon，LuCI 会自动回退到默认主题，不影响使用）
+uci set luci.main.mediaurlbase='/luci-static/argon'
 uci commit luci
 
 # 设置系统时区为北京时间
