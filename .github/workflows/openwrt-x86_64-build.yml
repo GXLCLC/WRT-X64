@@ -126,12 +126,12 @@ jobs:
         run: |
           cd openwrt
           git clone --depth 1 "$OPENAPPFILTER_URL" package/OpenAppFilter
-        - name: 下载EasyTier插件源码
+      - name: 下载EasyTier插件源码
         run: |
-         cd openwrt
-         rm -rf package/easytier package/luci-app-easytier
-         git clone --depth 1 "https://github.com/EasyTier/EasyTier" package/easytier
-         git clone --depth 1 "https://github.com/EasyTier/luci-app-easytier" package/luci-app-easytier
+          cd openwrt
+          rm -rf package/easytier package/luci-app-easytier
+          git clone --depth 1 "https://github.com/EasyTier/EasyTier" package/easytier
+          git clone --depth 1 "https://github.com/EasyTier/luci-app-easytier" package/luci-app-easytier
 
       # ============ 第 8 步：应用固件定制（改 LAN IP / 语言 / 密码等）============
       # 目的：调用 scripts/customize.sh，在固件里写入"首次启动自动执行"的设置
