@@ -36,7 +36,7 @@ env:
   KENZOK8_FEED: https://github.com/kenzok8/openwrt-packages      # 第三方源(ddnsto 在这里)
   OPENAPPFILTER_URL: https://github.com/destan19/OpenAppFilter   # 应用过滤插件(独立仓库)
   SMARTDNS_URL: https://github.com/pymumu/smartdns               #Smartdns
-  EASYTIER_URL: https://github.com/EasyTier/luci-app-easytier
+  
   TZ: Asia/Shanghai          # 让日志时间显示北京时间
 
 # 允许本工作流创建 Release（发布固件需要写仓库权限）
