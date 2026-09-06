@@ -1,0 +1,242 @@
+# =============================================================================
+# OpenWrt x86_64 云编译工作流（基于 Lean's LEDE 源码，Ubuntu 22.04 编译环境）
+#
+# 功能说明：
+#   - 拉取 coolsnowwolf/lede 最新源码，只编译 x86/64 平台
+#   - 插件配置在仓库 config/x86_64.config 中维护，修改后手动触发即可编译
+#   - 只产出 IMG 格式固件（BIOS + EFI），不生成 VMDK/VHDX 等格式
+#   - 编译完成后自动发布到 GitHub Releases，发布页含固件信息与逐行插件清单
+#   - 全程无需 SSH 登录服务器，由 GitHub 云主机直接完成编译
+# =============================================================================
+
+# 触发方式：仅手动触发（改完 config 配置后到 Actions 页面点 Run workflow）
+# 为什么用手动触发：完整编译约 2~4 小时，按需触发可自由掌控编译时机，避免无效编译浪费时长
+name: Build OpenWrt x86_64
+
+on:
+  workflow_dispatch:
+
+# 全局环境变量：集中管理，方便后续维护时只改一处
+env:
+  REPO_URL: https://github.com/coolsnowwolf/lede   # lede 源码仓库
+  REPO_BRANCH: master                              # 跟踪 master 分支（即最新代码）
+  CONFIG_FILE: config/x86_64.config                # 仓库内自定义固件配置文件路径
+  TZ: Asia/Shanghai                                # 统一时区，让 Release 标签时间与北京时间一致
+
+# 为什么需要 contents: write：工作流要创建 Release 并上传固件附件，需要仓库写权限
+permissions:
+  contents: write
+
+# 为什么加并发限制：防止误触多次导致多个 4 小时编译任务并行排队浪费时间
+concurrency:
+  group: build-openwrt-x86_64
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: 编译 x86_64 固件并发布
+    # ============================================================
+    # 关于运行环境的重要说明：
+    # GitHub 官方已宣布 ubuntu-22.04 云主机于 2026-09-17 起弃用
+    # （2027-04-17 完全停用，期间 brownout 会随机杀掉任务）。
+    # 为了既满足「Ubuntu 22.04 编译环境」的需求、又不受弃用影响，
+    # 这里采用「24.04 宿主机 + ubuntu:22.04 Docker 容器」方案：
+    # 编译实际发生在真正的 22.04 环境（glibc 2.35 / gcc 11）中。
+    # ============================================================
+    runs-on: ubuntu-24.04
+    container:
+      image: ubuntu:22.04            # 真正的编译环境：Ubuntu 22.04 容器
+      options: --volume /mnt:/mnt    # 把宿主机的大容量临时数据盘挂进容器，专供编译使用
+    timeout-minutes: 360             # 编译约 2~4 小时，设 6 小时上限防止任务异常时无限挂起
+    defaults:
+      run:
+        shell: bash                  # 容器内统一使用 bash，避免 sh 兼容性问题
+
+    steps:
+      - name: 初始化容器环境（安装 git、配置时区）
+        # 为什么需要这一步：ubuntu:22.04 官方镜像是最小化系统，
+        # 默认没有 git（actions/checkout 检出代码必需）和时区数据（北京时间的发布时间需要）
+        env:
+          DEBIAN_FRONTEND: noninteractive   # 非交互模式，防止 apt 安装时卡在时区选择等交互界面
+        run: |
+          apt-get update -y
+          apt-get install -y git ca-certificates tzdata
+          ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+          echo "容器初始化完成，当前时间：$(date '+%Y-%m-%d %H:%M:%S')"
+
+      - name: 检出本仓库代码
+        # 为什么需要检出：要读取仓库中 config/ 目录下的自定义固件配置文件
+        uses: actions/checkout@v4
+
+      - name: 选择编译目录（优先大容量临时盘）
+        # 为什么需要这一步：OpenWrt 完整编译约需 25GB 磁盘空间，
+        # GitHub 云主机 /mnt 挂载的临时数据盘约有 70GB 空闲，远大于系统盘剩余空间，
+        # 把源码与编译产物放到 /mnt 可以避免编译中途磁盘写满而失败；
+        # 若 /mnt 不可用则自动回退到工作目录，保证工作流在任何环境下都能跑
+        run: |
+          df -hT
+          MNT_FREE=$(df -BG --output=avail /mnt 2>/dev/null | tail -n1 | tr -dc '0-9')
+          if [ "${MNT_FREE:-0}" -ge 30 ]; then
+            BUILD_ROOT=/mnt/openwrt-build
+          else
+            BUILD_ROOT=$GITHUB_WORKSPACE/openwrt-build
+          fi
+          mkdir -p "$BUILD_ROOT"
+          echo "BUILD_ROOT=$BUILD_ROOT" >> "$GITHUB_ENV"
+          echo "编译目录已选定：$BUILD_ROOT（/mnt 可用空间 ${MNT_FREE:-0}GB）"
+
+      - name: 安装编译依赖
+        # 为什么需要安装：容器是纯净系统，缺少编译 OpenWrt 所需的编译器、函数库等工具；
+        # 依赖清单来自 lede 官方 README（明确支持 Ubuntu 22.04），不要随意删减
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update -y
+          apt-get full-upgrade -y
+          apt-get install -y ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk gcc-multilib g++-multilib gettext \
+            genisoimage git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev \
+            libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev \
+            libreadline-dev libssl-dev libtool llvm lrzsz libnsl-dev ninja-build p7zip p7zip-full patch pkgconf \
+            python3 python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion \
+            swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+
+      - name: 克隆 lede 最新源码
+        # 为什么用 --depth 1：只拉取最新一次提交，体积小速度快，满足「拉取最新源码」的需求
+        run: |
+          cd $BUILD_ROOT
+          git clone --depth 1 $REPO_URL -b $REPO_BRANCH openwrt
+          cd openwrt
+          # 记录源码最后一次提交信息，展示在 Release 发布页，便于追溯固件对应的源码版本
+          SOURCE_INFO=$(git log -1 --format='%h %cd' --date=format:'%Y-%m-%d %H:%M')
+          echo "SOURCE_INFO=$SOURCE_INFO" >> "$GITHUB_ENV"
+          echo "源码最后提交：$SOURCE_INFO"
+
+      - name: 更新并安装 feeds 软件源
+        # 为什么需要 feeds：feeds 是插件软件源（luci 插件、软件包都在里面），
+        # 必须先更新安装，后面的 make defconfig 才能识别到插件配置项
+        run: |
+          cd $BUILD_ROOT/openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 添加第三方插件源码（DDNSTO / OAF 应用过滤 / EasyTier）
+        # 为什么需要单独克隆：这三个插件不在 lede 官方 feeds 里，
+        # 从各自官方仓库拉取源码放入 package/ 目录，编译系统会自动递归识别；
+        #   DDNSTO      → linkease 官方包仓库（含 ddnsto + luci-app-ddnsto）
+        #   OpenAppFilter → oaf 官方仓库（选中 luci-app-oaf 会自动带上内核模块和特征库）
+        #   EasyTier    → EasyTier 官方 LuCI 仓库（含 easytier 核心程序 + luci-app-easytier）
+        run: |
+          cd $BUILD_ROOT/openwrt
+          git clone --depth 1 https://github.com/linkease/ddnsto-openwrt-package package/ddnsto-openwrt-package
+          git clone --depth 1 https://github.com/destan19/OpenAppFilter package/OpenAppFilter
+          git clone --depth 1 https://github.com/EasyTier/luci-app-easytier package/luci-app-easytier-repo
+
+      - name: 加载自定义固件配置并生成完整 .config
+        # 为什么这样做：以仓库里 config/x86_64.config 为基础（用户改这个文件即可增删插件），
+        # make defconfig 会自动补全所有依赖项生成完整配置；
+        # 随后打印最终生效的插件与驱动清单——因为包名写错不会报错、只会静默失效，必须人工核对日志
+        run: |
+          cp $CONFIG_FILE $BUILD_ROOT/openwrt/.config
+          cd $BUILD_ROOT/openwrt
+          make defconfig
+          echo "===== 已启用的 LuCI 插件（请核对目标插件是否都在列） ====="
+          grep -E '^CONFIG_PACKAGE_luci-app-.+=y' .config | sed 's/^CONFIG_PACKAGE_//;s/=y$//' | sort
+          echo "===== 关键驱动（USB / 瑞昱 / 英特尔） ====="
+          grep -E '^CONFIG_PACKAGE_kmod-' .config | grep -E 'usb|r81|8139|e10|igb|igc|ixg' | sed 's/^CONFIG_PACKAGE_//;s/=y$//' | sort
+
+      - name: 预下载全部源码包
+        # 为什么单独下载：提前并行下载所有源码包能充分利用带宽；
+        # 小于 1KB 的残缺文件先列日志再删除，避免正式编译阶段因个别坏包前功尽弃
+        run: |
+          cd $BUILD_ROOT/openwrt
+          make download -j$(nproc)
+          find dl -size -1024c -exec ls -l {} \;
+          find dl -size -1024c -exec rm -f {} \;
+
+      - name: 编译固件
+        # 为什么先多线程再单线程重试：多线程编译速度快（约 2~4 小时），
+        # 若失败则改用单线程并输出详细日志重跑，便于从日志定位真实报错原因；
+        # 编译全程由 GitHub 云主机自动完成，不使用任何 SSH 登录调试
+        run: |
+          cd $BUILD_ROOT/openwrt
+          echo "开始使用 $(nproc) 线程编译，预计 2~4 小时..."
+          make -j$(nproc) || make -j1 V=s
+          echo "编译结束，磁盘使用情况："
+          df -hT
+
+      - name: 整理固件文件并提取版本信息
+        # 为什么需要整理：编译产物目录层级较深，先把 IMG 固件与校验文件集中到发布目录；
+        # 同时提取内核版本、固件版本、逐行插件清单，用于生成 Release 发布页说明
+        run: |
+          cd $BUILD_ROOT/openwrt
+          OUT=$GITHUB_WORKSPACE/firmware
+          mkdir -p $OUT
+          # 只收集 IMG 格式固件（BIOS 传统启动 + EFI 新式启动两个版本），其他格式一律不带
+          cp bin/targets/*/*/openwrt-*-generic-squashfs-combined*.img.gz $OUT/
+          # 收集 SHA256 校验文件，供用户下载后校验固件完整性
+          cp bin/targets/*/*/sha256sums $OUT/ 2>/dev/null || true
+          ls -lh $OUT
+
+          # 内核版本：从内核源码目录名解析（如 linux-6.12.30 → 6.12.30）
+          KERNEL_VER=$(ls build_dir/target-*/linux-x86_64/ 2>/dev/null | grep -m1 '^linux-' | sed 's/^linux-//')
+          echo "KERNEL_VER=${KERNEL_VER:-未知}" >> "$GITHUB_ENV"
+
+          # 固件版本：读取固件根文件系统内的 /etc/openwrt_release
+          FW_VER=$(grep -m1 '^DISTRIB_RELEASE=' build_dir/target-*/root-x86_64/etc/openwrt_release 2>/dev/null | cut -d'"' -f2)
+          echo "FW_VER=${FW_VER:-LEDE-master}" >> "$GITHUB_ENV"
+
+          # 插件清单：从最终 .config 提取所有已启用的 luci-app 插件，一行一个
+          grep -E '^CONFIG_PACKAGE_luci-app-.+=y' .config | sed 's/^CONFIG_PACKAGE_//;s/=y$//' | sort -u > $OUT/plugins.txt
+          echo "PLUGIN_COUNT=$(wc -l < $OUT/plugins.txt)" >> "$GITHUB_ENV"
+
+          # 发布标签用编译时刻（北京时间）命名，保证每次构建标签唯一不冲突
+          echo "BUILD_TAG=$(date +%Y%m%d-%H%M)" >> "$GITHUB_ENV"
+
+      - name: 生成 Release 发布说明
+        # 为什么需要生成：按要求在发布页展示 LAN IP、登录账号密码、内核/固件版本、
+        # 刷写方法，并把插件清单逐行展示（每行一个插件），方便使用者直观了解固件
+        run: |
+          cd $GITHUB_WORKSPACE
+          PLUGINS=$(sed 's/^/- /' firmware/plugins.txt)
+          cat > release_body.md <<EOF
+          ## OpenWrt x86_64 固件信息
+
+          ### 基本信息
+          - 固件版本：${FW_VER}
+          - 内核版本：${KERNEL_VER}
+          - 源码来源：coolsnowwolf/lede（master 最新提交：${SOURCE_INFO}）
+          - 目标架构：x86_64
+          - 文件系统：squashfs（支持恢复出厂设置）
+          - Overlay 空间：2GB（预留空间，可自由安装插件与保存配置）
+          - 固件格式：IMG（gzip 压缩，含 BIOS 版与 EFI 版两个文件）
+          - 编译时间：$(date '+%Y-%m-%d %H:%M')（北京时间）
+
+          ### 登录信息
+          - LAN IP：192.168.1.1
+          - 后台地址：http://192.168.1.1
+          - 登录账号：root
+          - 登录密码：password（首次登录后请及时修改）
+
+          ### 刷写方法
+          - 下载 .img.gz 后用 balenaEtcher / Rufus 直接写入 U 盘或硬盘，
+            或 gunzip 解压得到 .img 后用 dd 命令写入，无需解压成 VHDX/VMDK
+
+          ### 已安装插件（共 ${PLUGIN_COUNT} 个，每行一个）
+          ${PLUGINS}
+          EOF
+          echo "===== 发布说明预览 ====="
+          cat release_body.md
+
+      - name: 发布到 GitHub Releases
+        # 为什么需要发布：把固件发布到仓库 Releases 页面，任何人都可以直接下载刷机使用；
+        # fail_on_unmatched_files 保证万一固件文件缺失时任务报错而不是发布空 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: openwrt-x86_64-${{ env.BUILD_TAG }}
+          name: OpenWrt x86_64 固件（${{ env.FW_VER }}）
+          body_path: release_body.md
+          files: |
+            firmware/*.img.gz
+            firmware/sha256sums
+          fail_on_unmatched_files: true
