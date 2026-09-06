@@ -22,6 +22,13 @@ env:
   REPO_BRANCH: master                              # 跟踪 master 分支（即最新代码）
   CONFIG_FILE: config/x86_64.config                # 仓库内自定义固件配置文件路径
   TZ: Asia/Shanghai                                # 统一时区，让 Release 标签时间与北京时间一致
+  LAN_IP: 192.168.2.1                              # 固件 LAN 口 IP（同时也是内网网关），改这里即可
+  LAN_NETMASK: 255.255.255.0                       # LAN 子网掩码
+  ROUTER_HOSTNAME: OpenWrt                         # 路由器主机名，改这里即可
+  # 为什么需要这个变量：GitHub 容器内默认以 root 用户编译，而 GNU tar 等少量软件包的
+  # configure 脚本会拒绝 root 运行（报错 you should not run configure as root），
+  # 设置 FORCE_UNSAFE_CONFIGURE=1 可绕过该检查，是容器化编译 OpenWrt 的通用做法
+  FORCE_UNSAFE_CONFIGURE: 1
 
 # 为什么需要 contents: write：工作流要创建 Release 并上传固件附件，需要仓库写权限
 permissions:
@@ -111,6 +118,24 @@ jobs:
           SOURCE_INFO=$(git log -1 --format='%h %cd' --date=format:'%Y-%m-%d %H:%M')
           echo "SOURCE_INFO=$SOURCE_INFO" >> "$GITHUB_ENV"
           echo "源码最后提交：$SOURCE_INFO"
+
+      - name: 固化自定义 LAN IP 与主机名
+        # 为什么这样做：OpenWrt 编译系统会把源码根目录的 files/ 整体并入固件，
+        # 其中 etc/uci-defaults/ 下的脚本会在首次开机时自动执行一次然后自我删除；
+        # 因此在这里生成设置脚本，把 LAN IP 与主机名直接固化进固件，刷机即生效、无需手动改；
+        # 脚本以 zzz99 开头（字母序靠后），确保在 lede 自带的 zzz-default-settings 之后执行、不被覆盖；
+        # DHCP 的起始地址是相对网段的偏移量，改 IP 后自动跟随新网段，无需额外处理
+        run: |
+          mkdir -p $BUILD_ROOT/openwrt/files/etc/uci-defaults
+          cat > $BUILD_ROOT/openwrt/files/etc/uci-defaults/zzz99-custom-settings <<EOF
+          uci set network.lan.ipaddr='${LAN_IP}'
+          uci set network.lan.netmask='${LAN_NETMASK}'
+          uci commit network
+          uci set system.@system[0].hostname='${ROUTER_HOSTNAME}'
+          uci commit system
+          EOF
+          echo "===== 已生成的自定义设置脚本（内容预览） ====="
+          cat $BUILD_ROOT/openwrt/files/etc/uci-defaults/zzz99-custom-settings
 
       - name: 更新并安装 feeds 软件源
         # 为什么需要 feeds：feeds 是插件软件源（luci 插件、软件包都在里面），
@@ -213,8 +238,9 @@ jobs:
           - 编译时间：$(date '+%Y-%m-%d %H:%M')（北京时间）
 
           ### 登录信息
-          - LAN IP：192.168.1.1
-          - 后台地址：http://192.168.1.1
+          - LAN IP：${LAN_IP}
+          - 后台地址：http://${LAN_IP}
+          - 主机名：${ROUTER_HOSTNAME}
           - 登录账号：root
           - 登录密码：password（首次登录后请及时修改）
 
