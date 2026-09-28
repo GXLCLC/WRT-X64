@@ -40,8 +40,8 @@ on:
 env:
   # LEDE 源码仓库地址（基础源码仓库，非插件源）
   LEDE_REPO_URL: "https://github.com/coolsnowwolf/lede"
-  # LEDE 源码分支
-  LEDE_BRANCH: "main"
+  # LEDE 源码分支（coolsnowwolf/lede 默认分支为 master）
+  LEDE_BRANCH: "master"
   # 编译目标架构
   TARGET_ARCH: "x86-64"
   # 编译线程数（使用全部可用核心）
