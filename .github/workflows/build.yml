@@ -123,6 +123,10 @@ jobs:
       # --------------------------------------------------------------------------
       # 步骤 5：拉取 LEDE 最新源码
       # 若缓存未命中则全新克隆；若缓存命中则更新到最新提交
+      # 注意：cache 步骤在本步骤之前恢复 openwrt/dl 和 openwrt/feeds，
+      #       会创建 openwrt/ 目录但没有 .git，导致 git clone 报
+      #       "destination path already exists" 错误。
+      #       处理：有 .git 则更新；无 .git 则先清空目录再克隆。
       # --------------------------------------------------------------------------
       - name: 拉取 LEDE 源码
         run: |
@@ -134,6 +138,12 @@ jobs:
             git reset --hard origin/${OPENWRT_BRANCH}
             git pull --ff-only origin ${OPENWRT_BRANCH} 2>/dev/null || true
           else
+            # openwrt/ 目录可能由 cache 恢复 dl/feeds 创建，但没有 .git
+            # 必须先删除再 clone，否则 git clone 报 "destination path already exists"
+            if [ -d "${OPENWRT_DIR}" ]; then
+              echo ">>> openwrt/ 目录存在但无 .git（cache 恢复残留），先清空"
+              rm -rf "${OPENWRT_DIR}"
+            fi
             echo ">>> 全新克隆 LEDE 源码（浅克隆以节省时间）"
             git clone --depth 1 --single-branch --branch ${OPENWRT_BRANCH} ${OPENWRT_REPO} ${OPENWRT_DIR}
             cd "${OPENWRT_DIR}"
