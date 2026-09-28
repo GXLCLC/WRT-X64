@@ -1,205 +1,168 @@
 #!/bin/bash
-# ================================================================
-# system_config.sh — OpenWrt 基础系统参数配置脚本
-# ----------------------------------------------------------------
-# 职责说明：
-#   本脚本专门负责修改 OpenWrt（LEDE）基础系统参数，包括：
-#     1. LAN 口 IP 地址
-#     2. 主机名称（hostname）
-#     3. 后台登录用户名（OpenWrt 默认 root，此处可自定义显示名）
-#     4. 登录密码
-#
+# ==============================================================================
+# system_config.sh - OpenWrt 基础系统参数配置脚本
+# --------------------------------------------------------------------------------
+# 脚本职责：专门修改 OpenWrt 基础系统参数，在 LEDE 源码的对应配置文件中写入参数
+# 修改范围：LAN 口 IP 地址、主机名称、后台登录用户名、登录密码、时区等
+# --------------------------------------------------------------------------------
 # 修改规则：
-#   后续如需修改 LAN IP、主机名、账号密码，
-#   【仅需修改本文件中的参数区】，无需改动 build.yml 或其他脚本。
-#
-# 调用时机：
-#   工作流拉取 LEDE 源码后、编译前调用。
-# ================================================================
+#   后续想要修改 LAN IP、主机名、账号密码，【只修改本脚本顶部参数区】，
+#   不需要改动 build.yml，也不需要修改其他脚本。
+# 运行位置：LEDE 源码根目录（由 build.yml 指定 working-directory: openwrt）
+# 工作流拉取 LEDE 源码并完成 feeds 管理后调用本脚本。
+# ==============================================================================
+set -e
 
-set -e  # 任何命令返回非零值立即退出，确保配置失败时终止编译
+# ==============================================================================
+# ★★★ 系统基础参数区（修改此处即可，无需改动 build.yml 与其他脚本）★★★
+# ==============================================================================
 
-# ================================================================
-# >>>>>>>>>>  参数区（使用者自行修改此处即可）  <<<<<<<<<<
-# ================================================================
-
-# LAN 口 IP 地址 —— 路由器管理后台访问地址
+# LAN 口 IP 地址（后台访问地址，浏览器输入此 IP 进入 LuCI 后台）
 LAN_IP="192.168.1.1"
 
-# LAN 口子网掩码
-LAN_NETMASK="255.255.255.0"
+# 主机名称（系统 hostname）
+HOST_NAME="OpenWrt"
 
-# 主机名称 —— 显示在 LuCI 后台及终端提示符
-HOSTNAME="OpenWrt"
+# 后台登录用户名（OpenWrt 默认 root）
+LOGIN_USER="root"
 
-# 后台登录用户名 —— OpenWrt 系统默认 root 账户
-# 注意：OpenWrt 基于 root 用户运行，修改用户名需调整多项系统文件，
-#       此处保留 root，仅作为 Release 信息展示用。
-ROOT_USERNAME="root"
-
-# 登录密码 —— 用于 SSH 登录及 LuCI 后台登录
-ROOT_PASSWORD="password"
+# 后台登录密码（明文，脚本会自动使用 openssl 加密后写入 shadow）
+LOGIN_PASSWORD="password"
 
 # 时区设置
-TIMEZONE="CST-8"      # 东八区（中国标准时间）
-TIMEZONE_AREA="Asia/Shanghai"
+TIMEZONE="CST-8"
+TIMEZONE_DESC="Asia/Shanghai"
 
-# 默认主题设置 —— Argon 主题
-DEFAULT_THEME="argon"
+# ==============================================================================
+# 以下为脚本实现，一般无需修改
+# ==============================================================================
 
-# ================================================================
-# >>>>>>>>>>  参数区结束（以下为执行逻辑，一般无需修改）  <<<<<<<<<<
-# ================================================================
+# base-files 配置生成脚本路径（LEDE 中 LAN/hostname 默认在此文件设置）
+CONFIG_GENERATE="package/base-files/files/bin/config_generate"
+# base-files 中的 shadow 文件路径（用于写入登录密码）
+SHADOW_FILE="package/base-files/files/etc/shadow"
+# base-files 中的系统配置文件路径
+SYSTEM_CONFIG_FILE="package/base-files/files/etc/config/system"
 
-# 获取 LEDE 源码根目录（由工作流通过环境变量传入，默认 ./lede）
-LEDE_ROOT="${LEDE_ROOT:-$(pwd)/lede}"
-
-echo "=========================================="
-echo "  开始配置 OpenWrt 系统参数"
-echo "=========================================="
-echo "  LAN IP:     ${LAN_IP}"
-echo "  子网掩码:    ${LAN_NETMASK}"
-echo "  主机名:      ${HOSTNAME}"
-echo "  登录用户:    ${ROOT_USERNAME}"
-echo "  时区:        ${TIMEZONE_AREA}"
-echo "=========================================="
-
-# ----------------------------------------------------------------
-# 1. 修改 LAN 口 IP 地址
-#    目标文件：package/base-files/files/etc/config/network
-#    该文件定义了 OpenWrt 默认网络接口配置
-# ----------------------------------------------------------------
-NETWORK_CONF="${LEDE_ROOT}/package/base-files/files/etc/config/network"
-
-if [ -f "${NETWORK_CONF}" ]; then
-    echo "[1/5] 正在修改 LAN 口 IP 地址 -> ${LAN_IP}"
-    # 替换 lan 接口的 ipaddr 字段
-    sed -i "/config interface 'lan'/,/^\s*$/ s|option ipaddr .*|option ipaddr '${LAN_IP}'|" "${NETWORK_CONF}"
-    # 替换 lan 接口的 netmask 字段
-    sed -i "/config interface 'lan'/,/^\s*$/ s|option netmask .*|option netmask '${LAN_NETMASK}'|" "${NETWORK_CONF}"
-    echo "      LAN 口 IP 配置完成"
-else
-    echo "[警告] 未找到 network 配置文件: ${NETWORK_CONF}"
-fi
-
-# ----------------------------------------------------------------
-# 2. 修改主机名称
-#    目标文件：package/base-files/files/etc/config/system
-# ----------------------------------------------------------------
-SYSTEM_CONF="${LEDE_ROOT}/package/base-files/files/etc/config/system"
-
-if [ -f "${SYSTEM_CONF}" ]; then
-    echo "[2/5] 正在修改主机名 -> ${HOSTNAME}"
-    # 替换 hostname 字段
-    sed -i "s|option hostname .*|option hostname '${HOSTNAME}'|" "${SYSTEM_CONF}"
-    echo "      主机名配置完成"
-else
-    echo "[警告] 未找到 system 配置文件: ${SYSTEM_CONF}"
-fi
-
-# ----------------------------------------------------------------
-# 3. 设置 root 登录密码
-#    目标文件：package/base-files/files/etc/shadow
-#    使用 openssl 生成 SHA-512 密码哈希，写入 shadow 文件
-# ----------------------------------------------------------------
-SHADOW_CONF="${LEDE_ROOT}/package/base-files/files/etc/shadow"
-
-echo "[3/5] 正在设置 root 登录密码"
-# 使用 openssl 生成 SHA-512 加密哈希（-6 表示 SHA-512 方法）
-PASSWORD_HASH=$(openssl passwd -6 "${ROOT_PASSWORD}")
-
-if [ -f "${SHADOW_CONF}" ]; then
-    # 替换 shadow 文件中 root 行的密码哈希字段
-    # shadow 格式：username:password_hash:lastchange:min:max:warn:inactive:expire:reserved
-    sed -i "s|^root:[^:]*:|root:${PASSWORD_HASH}:|" "${SHADOW_CONF}"
-    echo "      root 密码配置完成"
-else
-    # 若 shadow 文件不存在，直接创建
-    mkdir -p "$(dirname "${SHADOW_CONF}")"
-    echo "root:${PASSWORD_HASH}:19000:0:99999:7:::" > "${SHADOW_CONF}"
-    echo "      已创建 shadow 文件并写入 root 密码"
-fi
-
-# ----------------------------------------------------------------
-# 4. 设置系统时区
-#    目标文件：package/base-files/files/etc/config/system
-# ----------------------------------------------------------------
-echo "[4/5] 正在配置系统时区 -> ${TIMEZONE_AREA}"
-if [ -f "${SYSTEM_CONF}" ]; then
-    # 检查是否已存在 zonename 配置，存在则替换，不存在则追加
-    if grep -q "option zonename" "${SYSTEM_CONF}"; then
-        sed -i "s|option zonename .*|option zonename '${TIMEZONE_AREA}'|" "${SYSTEM_CONF}"
+# ------------------------------------------------------------------------------
+# 工具函数：安全地修改文件（避免 sed 特殊字符问题，使用 awk 替换）
+# 用法：safe_replace_shadow <shadow文件> <加密密码>
+# shadow 文件格式：用户名:加密密码:...（密码为第二个字段）
+# ------------------------------------------------------------------------------
+set_shadow_password() {
+    local shadow_file="$1"
+    local encrypted_pwd="$2"
+    mkdir -p "$(dirname "${shadow_file}")"
+    if [ -f "${shadow_file}" ]; then
+        # 使用 awk 安全替换 root 行的密码字段，避免 sed 对 $ / 等字符的解析问题
+        awk -v passwd="${encrypted_pwd}" -F: 'BEGIN{OFS=":"} {
+            if ($1 == "root") { $2 = passwd }
+            print
+        }' "${shadow_file}" > "${shadow_file}.tmp" && mv "${shadow_file}.tmp" "${shadow_file}"
     else
-        # 在 system 配置块的末尾追加时区设置
-        sed -i "/^config system/a\\	option zonename '${TIMEZONE_AREA}'" "${SYSTEM_CONF}"
+        # shadow 文件不存在则创建（OpenWrt shadow 行格式：用户:密码:LAST:MIN:MAX:WARN:INACTIVE:EXPIRE:RESERVED）
+        echo "root:${encrypted_pwd}:17000:0:99999:7:::" > "${shadow_file}"
     fi
-    # 同步修改 timezone（POSIX 格式时区）
-    if grep -q "option timezone" "${SYSTEM_CONF}"; then
-        sed -i "s|option timezone .*|option timezone '${TIMEZONE}'|" "${SYSTEM_CONF}"
-    else
-        sed -i "/^config system/a\\	option timezone '${TIMEZONE}'" "${SYSTEM_CONF}"
-    fi
-    echo "      时区配置完成"
-fi
+}
 
-# ----------------------------------------------------------------
-# 5. 设置 Argon 为系统默认主题
-#    目标文件：package/base-files/files/etc/config/luci
-#    通过修改 mediaurlbase 指向 argon 主题静态资源路径
-# ----------------------------------------------------------------
-LUCI_CONF="${LEDE_ROOT}/package/base-files/files/etc/config/luci"
-
-echo "[5/5] 正在设置默认主题 -> ${DEFAULT_THEME}"
-# 确定主题静态资源路径
-case "${DEFAULT_THEME}" in
-    argon)
-        THEME_URLBASE="/luci-static/argon"
-        ;;
-    bootstrap)
-        THEME_URLBASE="/luci-static/bootstrap"
-        ;;
-    *)
-        THEME_URLBASE="/luci-static/${DEFAULT_THEME}"
-        ;;
-esac
-
-if [ -f "${LUCI_CONF}" ]; then
-    # 若 luci 配置文件已存在 mediaurlbase，则替换
-    if grep -q "option mediaurlbase" "${LUCI_CONF}"; then
-        sed -i "s|option mediaurlbase .*|option mediaurlbase '${THEME_URLBASE}'|" "${LUCI_CONF}"
-    else
-        # 不存在则在 config core 'main' 块下追加
-        sed -i "/^config core 'main'/a\\	option mediaurlbase '${THEME_URLBASE}'" "${LUCI_CONF}"
-    fi
-    echo "      默认主题配置完成: ${DEFAULT_THEME} (${THEME_URLBASE})"
+# ==============================================================================
+# 步骤 1：修改 LAN 口 IP 地址
+# 在 config_generate 中将默认 LAN IP 替换为自定义 IP
+# ==============================================================================
+echo ">>> [1/5] 修改 LAN 口 IP 地址为：${LAN_IP}"
+if [ -f "${CONFIG_GENERATE}" ]; then
+    # config_generate 中默认 LAN IP 为 192.168.1.1
+    sed -i "s/192\.168\.1\.1/${LAN_IP}/g" "${CONFIG_GENERATE}"
+    echo "    LAN IP 已写入 ${CONFIG_GENERATE}"
 else
-    # 配置文件不存在则创建
-    mkdir -p "$(dirname "${LUCI_CONF}")"
-    cat > "${LUCI_CONF}" <<LUCIEOF
-config core 'main'
-	option lang 'zh_cn'
-	option mediaurlbase '${THEME_URLBASE}'
-	option resourcebase '/luci-static/resources'
-	option ubuspath '/ubus/'
-
-config internal 'themes'
-	option Argon '/luci-static/argon'
-	option Bootstrap '/luci-static/bootstrap'
-LUCIEOF
-    echo "      已创建 luci 配置文件并设置默认主题"
+    echo "    警告：未找到 ${CONFIG_GENERATE}，跳过 LAN IP 修改"
 fi
 
-# 创建 UCI 默认脚本，确保首次启动时主题生效
-UCI_DEFAULTS_DIR="${LEDE_ROOT}/package/base-files/files/etc/uci-defaults"
-mkdir -p "${UCI_DEFAULTS_DIR}"
-cat > "${UCI_DEFAULTS_DIR}/99-default-theme" <<'UCIEOF'
-# 设置默认主题为 Argon
-uci set luci.main.mediaurlbase='/luci-static/argon'
-uci commit luci
-exit 0
-UCIEOF
-echo "      UCI 默认主题脚本已写入"
+# ==============================================================================
+# 步骤 2：修改主机名称
+# ==============================================================================
+echo ">>> [2/5] 修改主机名为：${HOST_NAME}"
+if [ -f "${CONFIG_GENERATE}" ]; then
+    # config_generate 中 hostname 通过 set_system_setting hostname 设置，默认值 OpenWrt
+    sed -i "s/hostname='OpenWrt'/hostname='${HOST_NAME}'/g" "${CONFIG_GENERATE}"
+    sed -i "s/set_system_setting hostname 'OpenWrt'/set_system_setting hostname '${HOST_NAME}'/g" "${CONFIG_GENERATE}" 2>/dev/null || true
+    echo "    主机名已写入 ${CONFIG_GENERATE}"
+fi
+if [ -f "${SYSTEM_CONFIG_FILE}" ]; then
+    # 修改 /etc/config/system 中的 hostname 字段
+    sed -i "s/option hostname .*/option hostname '${HOST_NAME}'/g" "${SYSTEM_CONFIG_FILE}" 2>/dev/null || true
+    echo "    主机名已写入 ${SYSTEM_CONFIG_FILE}"
+fi
 
-echo "=========================================="
-echo "  OpenWrt 系统参数配置全部完成！"
-echo "=========================================="
+# ==============================================================================
+# 步骤 3：设置后台登录用户名
+# OpenWrt 后台默认使用 root 账户，此处通过注释说明，
+# 并在 base-files 的 /etc/passwd 中确保 root 账户未锁定
+# ==============================================================================
+echo ">>> [3/5] 设置后台登录用户名为：${LOGIN_USER}"
+PASSWD_FILE="package/base-files/files/etc/passwd"
+mkdir -p "$(dirname "${PASSWD_FILE}")"
+if [ -f "${PASSWD_FILE}" ]; then
+    # 确保 root 行存在且未被锁定（移除可能的 ! 锁定标记）
+    if grep -q "^${LOGIN_USER}:" "${PASSWD_FILE}"; then
+        sed -i "s|^${LOGIN_USER}:x:|${LOGIN_USER}:x:|" "${PASSWD_FILE}"
+        echo "    用户 ${LOGIN_USER} 已存在且已启用"
+    else
+        echo "${LOGIN_USER}:x:0:0:${LOGIN_USER}:/root:/bin/ash" >> "${PASSWD_FILE}"
+        echo "    已添加用户 ${LOGIN_USER}"
+    fi
+else
+    echo "${LOGIN_USER}:x:0:0:${LOGIN_USER}:/root:/bin/ash" > "${PASSWD_FILE}"
+    echo "    已创建 passwd 文件并添加用户 ${LOGIN_USER}"
+fi
+
+# ==============================================================================
+# 步骤 4：设置后台登录密码
+# 使用 openssl 生成 MD5 加密密码串（OpenWrt shadow 兼容 $1$ MD5 格式）
+# ==============================================================================
+echo ">>> [4/5] 设置后台登录密码"
+if command -v openssl > /dev/null 2>&1; then
+    ENCRYPTED_PASSWORD=$(openssl passwd -1 "${LOGIN_PASSWORD}")
+    echo "    使用 openssl 生成加密密码"
+else
+    # 兜底：使用 mkpasswd
+    ENCRYPTED_PASSWORD=$(mkpasswd -m md5 "${LOGIN_PASSWORD}" 2>/dev/null || echo "${LOGIN_PASSWORD}")
+    echo "    使用 mkpasswd 生成加密密码"
+fi
+set_shadow_password "${SHADOW_FILE}" "${ENCRYPTED_PASSWORD}"
+echo "    登录密码已写入 ${SHADOW_FILE}"
+
+# ==============================================================================
+# 步骤 5：设置时区
+# ==============================================================================
+echo ">>> [5/5] 设置时区为：${TIMEZONE_DESC}"
+if [ -f "${CONFIG_GENERATE}" ]; then
+    # config_generate 中默认时区为 UTC，set_system_setting timezone 'UTC'
+    sed -i "s/'UTC'/'${TIMEZONE}'/g" "${CONFIG_GENERATE}"
+    sed -i "s/'UTC, +00:00'/'${TIMEZONE_DESC}'/g" "${CONFIG_GENERATE}" 2>/dev/null || true
+    echo "    时区已写入 ${CONFIG_GENERATE}"
+fi
+
+# ==============================================================================
+# 将配置参数导出到 .system_config.env，供 gen_release_info.sh 读取
+# 这样 Release 页面可自动填充 LAN IP、账号密码等信息
+# ==============================================================================
+cat > .system_config.env <<EOF
+# 由 system_config.sh 自动生成，供 gen_release_info.sh 读取
+LAN_IP="${LAN_IP}"
+HOST_NAME="${HOST_NAME}"
+LOGIN_USER="${LOGIN_USER}"
+LOGIN_PASSWORD="${LOGIN_PASSWORD}"
+TIMEZONE_DESC="${TIMEZONE_DESC}"
+EOF
+echo ">>> 系统配置参数已导出到 .system_config.env（供 Release 信息生成使用）"
+
+echo ""
+echo "========================================"
+echo ">>> system_config.sh 执行完成"
+echo "    LAN IP:    ${LAN_IP}"
+echo "    主机名:    ${HOST_NAME}"
+echo "    用户名:    ${LOGIN_USER}"
+echo "    密码:      ${LOGIN_PASSWORD}"
+echo "    时区:      ${TIMEZONE_DESC}"
+echo "========================================"

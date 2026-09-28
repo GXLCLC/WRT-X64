@@ -1,141 +1,162 @@
-# OpenWrt LEDE 云编译（X86_64）
+# OpenWrt 云编译仓库
 
-基于 GitHub Actions 的 OpenWrt LEDE 自动化云编译仓库，编译环境为 Ubuntu 22.04，目标架构为 X86_64，生成 squashfs 格式 combined IMG 镜像。
+基于 Ubuntu 22.04 环境的 OpenWrt（LEDE）云编译仓库，使用 GitHub Actions 自动编译 **X86_64 架构** 固件，编译成功后自动发布到 GitHub Releases。
 
-## 仓库结构
+## 功能特性
+
+- 全程自动化执行，无交互式 SSH 登录操作
+- 工作流与脚本解耦：`build.yml` 仅负责流水线调度，所有配置逻辑剥离到独立脚本
+- 仅编译 X86_64 架构 squashfs combined 镜像，overlay 预留 2G 可写空间
+- 自动拉取 LEDE 最新源码，集成常用第三方插件（无任何代理类插件）
+- 自动扩容 Runner 磁盘、缓存源码与 feeds，规避磁盘不足、加速重复编译
+- 编译失败立即终止工作流；编译成功自动创建 Release 并填充固件信息
+- 内置 USB / Intel / Realtek 网卡驱动
+
+## 仓库目录结构
 
 ```
 .
-├── .github/workflows/
-│   └── build.yml              # 主工作流（仅负责流水线调度，不硬编码插件源和系统参数）
+├── .github/
+│   └── workflows/
+│       └── build.yml              # 主工作流（流水线调度，不硬编码插件源/系统参数）
 ├── scripts/
-│   ├── feeds_manage.sh        # 第三方插件源管理脚本（稀疏克隆，不全量拉取）
-│   ├── system_config.sh       # 系统参数配置脚本（LAN IP / 主机名 / 密码 / 主题）
-│   └── gen_release_info.sh    # Release 发布信息生成脚本
+│   ├── feeds_manage.sh            # 第三方插件源管理（稀疏克隆 + feeds update/install）
+│   ├── system_config.sh           # 系统基础参数（LAN IP/主机名/账号密码/时区）
+│   └── gen_release_info.sh        # Release 信息生成（读取配置/内核/插件清单）
 ├── config/
-│   └── .config                # 固件编译配置文件（用户在此增减插件）
+│   └── .config                    # 固件编译配置（用户在此勾选增减插件）
 ├── docs/
-│   └── release_template.md    # Release 信息模板
-├── .gitignore
-└── README.md
+│   └── release_template.md        # Release 页面信息模板
+├── README.md                      # 本说明文件
+└── .gitignore                     # git 忽略文件
 ```
 
-## 固件特性
+## 已集成插件
 
-| 项目 | 说明 |
-|------|------|
-| 架构 | x86_64 |
-| 镜像格式 | squashfs combined（仅输出 IMG） |
-| 叠加层 | /overlay 预留约 2GB 可写空间 |
-| 默认主题 | Argon |
-| 网卡驱动 | Intel（e1000/e1000e/igb/igc/ixgbe）、Realtek（r8169/r8125/r8168） |
-| USB 驱动 | USB 2.0/3.0 核心 + USB 存储 + USB 网卡 |
-| 代理插件 | 不包含任何代理类插件 |
+| 插件 | 说明 | 来源 |
+| --- | --- | --- |
+| Smart DNS | 智能 DNS 解析分流，支持测速择优 | kenzok8/openwrt-packages |
+| DDNSTO | 内网穿透 / DDNS 远程访问 | linkease/nas-packages-luci + nas-packages |
+| AdGuardHome | 去广告 + DNS 过滤 | LEDE 官方 / kenzok8 |
+| OFA (应用过滤) | 应用层特征过滤 | kenzok8/openwrt-packages |
+| TurboAcc 加速 | 流量加速 / NAT 加速 / BBR | LEDE 官方 |
+| mwan3 | 多 WAN 负载均衡 / 策略路由 | LEDE 官方 |
+| Argon 主题 | 设为系统默认主题 | kenzok8/openwrt-packages |
+| argon-config | Argon 主题在线配置 | kenzok8/openwrt-packages |
+| 带宽监控 (nlbwmon) | 网络带宽监控 | LEDE 官方 |
+| EasyTier 内网穿透 | 去中心化组网 | EasyTier/luci-app-easytier |
 
-### 已集成插件
+> 仓库不添加任何代理类插件。
 
-- **Smart DNS** — 智能 DNS 分流
-- **DDNSTO** — 内网穿透远程访问
-- **AdGuardHome** — 广告过滤 / DNS 拦截
-- **OFA（OpenAppFilter）** — 应用过滤
-- **TurboAcc** — 网络加速 / NAT 转发加速
-- **mwan3** — 多 WAN 负载均衡
-- **Argon 主题 + argon-config** — 默认主题及配置器
-- **带宽监控（nlbwmon）** — 网络带宽监控
-- **EasyTier** — 内网穿透组网
+## 驱动支持
+
+- USB 总线与 USB 主机控制器（USB2/UHCI/OHCI/USB3）
+- USB 网卡（ASIX / AX88179 / RTL8150 / RTL8152 / CDC-NCM 等）
+- Intel 网卡（e1000 / e1000e / igb / igbvf / ixgbe / i40e / igc）
+- Realtek 网卡（r8169 / 8139cp / 8139too）
 
 ## 使用方法
 
 ### 1. 触发编译
 
-以下方式均可触发编译：
-- **推送代码**：修改 `config/.config`、`scripts/`、`docs/release_template.md` 或 `build.yml` 后推送到 `main` 分支
-- **手动触发**：在 GitHub 仓库 → Actions 页面选择 "OpenWrt LEDE 云编译" → 点击 "Run workflow"
-- **定时触发**：每周日凌晨 3:00（北京时间）自动编译
+两种方式触发：
 
-### 2. 获取固件
+- **手动触发**：在仓库 `Actions` 页面选择「OpenWrt 云编译」工作流，点击 `Run workflow`，可在输入框填写自定义 Release 标签（留空自动生成）
+- **自动触发**：向 `main` 分支推送代码，且改动涉及 `config/.config`、`scripts/` 或 `build.yml` 时自动触发
 
-编译成功后：
-1. 在仓库 **Releases** 页面找到对应版本的 Release
-2. 下载 `.img.gz` 镜像文件
-3. 解压：`gunzip openwrt-x86-64-generic-squashfs-combined.img.gz`
-4. 写入磁盘：`dd if=openwrt-x86-64-generic-squashfs-combined.img of=/dev/sdX bs=1M`
-5. 启动设备，浏览器访问管理后台（默认 `http://192.168.1.1`）
+### 2. 修改插件（增减插件）
 
-### 3. 修改系统参数
+修改 `config/.config`：
 
-**修改 LAN IP、主机名、登录密码、主题**：
+- 添加插件：将对应行改为 `CONFIG_PACKAGE_xxx=y`
+- 移除插件：将对应行改为 `# CONFIG_PACKAGE_xxx is not set`
+- 提交后自动触发重新编译
 
-只需编辑 [scripts/system_config.sh](scripts/system_config.sh) 中的参数区：
+### 3. 修改系统参数（LAN IP / 主机名 / 账号密码）
+
+仅修改 `scripts/system_config.sh` 顶部参数区：
 
 ```bash
-# LAN 口 IP 地址
-LAN_IP="192.168.1.1"
-
-# 主机名称
-HOSTNAME="OpenWrt"
-
-# 登录用户名
-ROOT_USERNAME="root"
-
-# 登录密码
-ROOT_PASSWORD="password"
-
-# 默认主题
-DEFAULT_THEME="argon"
+LAN_IP="192.168.1.1"          # LAN 口 IP
+HOST_NAME="OpenWrt"           # 主机名
+LOGIN_USER="root"             # 登录用户名
+LOGIN_PASSWORD="password"     # 登录密码
 ```
 
-修改后提交即可触发重新编译，无需改动 `build.yml` 或其他脚本。
+无需改动 `build.yml` 或其他脚本。
 
-### 4. 增减编译插件
+### 4. 新增第三方插件源
 
-**场景一：插件已在 LEDE 原生 feeds 或已有外挂源中**
+若插件不在 LEDE 原生 feeds 且不在已有外挂源内：
 
-编辑 [config/.config](config/.config)，找到对应插件行：
-- 启用：`CONFIG_PACKAGE_luci-app-xxx=y`
-- 禁用：`CONFIG_PACKAGE_luci-app-xxx=n`（或注释掉）
-
-**场景二：需要新增不在现有列表的第三方插件源**
-
-1. 编辑 [scripts/feeds_manage.sh](scripts/feeds_manage.sh)，在 `THIRD_PARTY_FEEDS` 数组中添加：
+1. 在 `scripts/feeds_manage.sh` 顶部配置区新增：
+   ```bash
+   FEED_XXX_REPO="https://github.com/xxx/yyy"
+   FEED_XXX_PACKAGES="luci-app-xxx"   # 仅克隆所需插件目录
+   FEED_XXX_BRANCH="main"
    ```
-   "仓库名|仓库URL|仓库内插件目录路径|目标放置目录"
-   ```
-2. 编辑 [config/.config](config/.config)，添加 `CONFIG_PACKAGE_luci-app-xxx=y`
-3. 提交代码，触发编译
+2. 在主流程中调用 `sparse_clone` 与 `register_feed`
+3. 在 `config/.config` 中开启对应 `CONFIG_PACKAGE_luci-app-xxx=y`
 
-**场景三：修改 LAN IP / 主机名 / 账号密码**
+无需改动 `build.yml`。
 
-编辑 [scripts/system_config.sh](scripts/system_config.sh) 参数区即可，无需改动 `build.yml`。
+### 5. 修改 Release 模板
 
-### 5. 修改 Release 信息模板
+编辑 `docs/release_template.md`，使用 `{{占位符}}` 引用变量（占位符会被 `gen_release_info.sh` 自动替换）：
 
-编辑 [docs/release_template.md](docs/release_template.md)，模板中的 `{{占位符}}` 会在编译完成后由 `gen_release_info.sh` 自动替换为实际值。
+| 占位符 | 含义 |
+| --- | --- |
+| `{{LAN_IP}}` | LAN 口 IP |
+| `{{HOST_NAME}}` | 主机名 |
+| `{{LOGIN_USER}}` | 登录用户名 |
+| `{{LOGIN_PASSWORD}}` | 登录密码 |
+| `{{KERNEL_VERSION}}` | 内核版本 |
+| `{{FIRMWARE_VERSION}}` | 固件版本 |
+| `{{BUILD_DATE}}` | 编译日期 |
+| `{{LEDE_COMMIT}}` | LEDE 源码 commit 信息 |
+| `{{PACKAGES}}` | 已安装插件清单（每行一个） |
 
-## 工作流优化
+## 镜像说明
 
-| 优化项 | 说明 |
-|--------|------|
-| 源码缓存 | 使用 actions/cache 缓存 LEDE 源码和 feeds，避免重复全量克隆 |
-| 下载缓存 | 缓存 dl/ 目录（源码包），避免重复下载 |
-| 磁盘扩容 | 编译前清理 Runner 预装组件，释放约 10GB+ 磁盘空间 |
-| 错误终止 | 编译出错时工作流立即终止，不继续后续步骤 |
+- 产物：`*.img.gz`（gzip 压缩的 squashfs combined 镜像）
+- 仅生成 IMG 镜像，不生成 VHDX / VMDK / QCOW 等其他格式
+- overlay 预留 2G 可写空间，用于运行时安装软件包、存放缓存与保存配置
+- 刷写前需先解压：`gunzip xxx.img.gz`
+- 写盘命令（Linux）：`sudo dd if=xxx.img of=/dev/sdX bs=4M status=progress`
 
-## 第三方插件源
+## 工作流执行流程
 
-| 插件 | 仓库地址 |
-|------|----------|
-| SmartDNS / AdGuardHome / OFA / Argon 主题等 | https://github.com/kenzok8/openwrt-packages |
-| EasyTier | https://github.com/EasyTier/luci-app-easytier |
-| DDNSTO（LuCI 界面） | https://github.com/linkease/nas-packages-luci |
-| DDNSTO（后端程序） | https://github.com/linkease/nas-packages |
+1. 检出仓库代码
+2. 扩容 Runner 磁盘（删除 .NET/Android/Haskell 等大型工具链）
+3. 初始化编译环境（安装依赖）
+4. 缓存源码与 feeds（`actions/cache`，按 `.config` 与 `feeds_manage.sh` 内容键控）
+5. 拉取 LEDE 最新源码
+6. 应用 `config/.config` 编译配置
+7. 执行 `scripts/feeds_manage.sh`（管理第三方插件源）
+8. 执行 `scripts/system_config.sh`（修改系统参数）
+9. `make defconfig` + `make download`（生成配置并预下载依赖）
+10. `make` 编译固件（失败即终止）
+11. 执行 `scripts/gen_release_info.sh` 生成 Release 正文
+12. 收集 IMG 镜像（排除 VHDX/VMDK）
+13. 自动创建 GitHub Release 并上传镜像
+14. 失败时上传编译日志便于排查
 
-> 以上第三方插件均采用稀疏克隆方式，仅拉取所需目录，不全量克隆整个仓库。
+## 扩展修改规则一览
 
-## 注意事项
+| 需求 | 修改位置 | 是否需改动 build.yml |
+| --- | --- | --- |
+| 增减 LEDE 原生/已有外挂源插件 | `config/.config` | 否 |
+| 新增第三方插件源 | `scripts/feeds_manage.sh` + `config/.config` | 否 |
+| 修改 LAN IP/主机名/账号密码 | `scripts/system_config.sh` | 否 |
+| 修改 Release 模板 | `docs/release_template.md` | 否 |
 
-1. 本仓库不包含任何代理类插件
-2. 镜像仅输出 IMG 格式，不生成 VHDX、VMDK 等格式
-3. 固件 squashfs 只读根文件系统 + overlay 可写层设计，恢复出厂设置只需清除 overlay
-4. 首次启动后建议立即修改默认密码
-5. GitHub Actions 免费额度有限，请合理控制编译频率
+## 常见问题
+
+- **首次编译时间较长**：首次克隆源码与下载依赖耗时较久，后续编译命中缓存会显著加速
+- **磁盘空间不足**：工作流已内置 Runner 磁盘扩容步骤，通常不会出现该问题
+- **插件编译失败**：检查 `.config` 是否开启了不存在的插件，或对应第三方源地址是否变更
+- **Release 未发布**：确认仓库 `Settings -> Actions -> General -> Workflow permissions` 已勾选「Read and write permissions」
+
+## 免责声明
+
+本固件仅供学习与交流使用，请勿用于商业用途。编译所用源码与插件均来自各自开源仓库，版权归原作者所有。使用本固件产生的任何后果由使用者自行承担。

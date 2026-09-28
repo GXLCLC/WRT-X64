@@ -1,32 +1,39 @@
-# ============================================
-# OpenWrt 云编译仓库 Git 忽略文件
-# ============================================
+# ==============================================================================
+# OpenWrt 云编译仓库 git 忽略文件
+# ==============================================================================
 
-# 编译输出目录（编译产物不纳入版本管理）
-bin/
-build_dir/
-tmp/
-staging_dir/
+# LEDE 源码目录（工作流运行时克隆，不入库）
+openwrt/
+third_party_feeds/
 
-# LEDE 源码目录（由工作流动态拉取，不入库）
-lede/
+# 编译产物与临时文件
+artifacts/
+*.img
+*.img.gz
+*.bin
+*.vmdk
+*.vhdx
+*.qcow2
+*.tar.gz
+*.ipk
 
-# 系统临时文件
+# 工作流运行时生成的中间文件
 *.log
 *.tmp
-*.bak
-*.swp
-*~
+build.log
+release_body.md
+LEDE_COMMIT_INFO.txt
+.system_config.env
+
+# 编辑器与系统文件
 .DS_Store
 Thumbs.db
-
-# 编辑器配置文件
+*.swp
+*.swo
+*~
 .vscode/
 .idea/
 
-# 本地环境变量文件（防止敏感信息泄露）
-.env
-.env.local
-
-# 缓存目录
-.cache/
+# 临时下载缓存
+dl/
+feeds/

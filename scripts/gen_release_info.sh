@@ -1,186 +1,152 @@
 #!/bin/bash
-# ================================================================
-# gen_release_info.sh — Release 发布信息生成脚本
-# ----------------------------------------------------------------
-# 职责说明：
-#   编译完成后，自动读取系统配置、内核版本、已安装插件清单等信息，
-#   依据 docs/release_template.md 模板，生成 Release 页面 Markdown 正文。
-#
-# 数据来源：
-#   1. 系统参数 -> 从 system_config.sh 中解析（LAN IP、账号密码等）
-#   2. 内核版本 -> 从 LEDE 源码 Makefile 中提取
-#   3. 固件版本 -> 从 LEDE 源码 Makefile 中提取
-#   4. 插件清单 -> 从编译后的 .config 中提取所有已启用的 luci-app 包
-# ================================================================
-
+# ==============================================================================
+# gen_release_info.sh - Release 信息生成辅助脚本
+# --------------------------------------------------------------------------------
+# 脚本职责：编译完成自动读取 system_config.sh 内配置、内核版本、插件清单等信息，
+#           生成 Release 页面 markdown 正文，输出到标准输出（stdout）。
+# 用法：bash scripts/gen_release_info.sh > release_body.md
+# 运行位置：仓库根目录（由 build.yml 直接调用，未指定 working-directory）
+# 说明：
+#   - 从 scripts/system_config.sh 解析系统参数（不执行该脚本，避免修改源码）
+#   - 从 openwrt/ 源码目录读取内核版本与固件版本
+#   - 从 config/.config 读取已安装插件清单
+#   - 优先使用 docs/release_template.md 模板，无模板时输出默认格式
+# ==============================================================================
 set -e
 
-# 获取 LEDE 源码根目录
-LEDE_ROOT="${LEDE_ROOT:-$(pwd)/lede}"
-
-# 获取仓库根目录（本仓库根目录，用于读取模板文件）
-REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
-
-# 输出文件路径（Markdown 正文）
-OUTPUT_FILE="${OUTPUT_FILE:-${REPO_ROOT}/release_info.md}"
-
-echo "=========================================="
-echo "  开始生成 Release 发布信息"
-echo "=========================================="
-
-# ================================================================
-# 1. 从 system_config.sh 中解析系统参数
-#    通过 grep 提取变量赋值值，避免直接 source 执行整个脚本
-# ================================================================
-SYSTEM_CONFIG="${REPO_ROOT}/scripts/system_config.sh"
-
-# 提取 LAN IP
-LAN_IP=$(grep -E "^LAN_IP=" "${SYSTEM_CONFIG}" | head -1 | sed "s/.*=\"//;s/\"$//")
-# 提取主机名
-HOSTNAME=$(grep -E "^HOSTNAME=" "${SYSTEM_CONFIG}" | head -1 | sed "s/.*=\"//;s/\"$//")
-# 提取登录用户名
-ROOT_USERNAME=$(grep -E "^ROOT_USERNAME=" "${SYSTEM_CONFIG}" | head -1 | sed "s/.*=\"//;s/\"$//")
-# 提取登录密码
-ROOT_PASSWORD=$(grep -E "^ROOT_PASSWORD=" "${SYSTEM_CONFIG}" | head -1 | sed "s/.*=\"//;s/\"$//")
-# 提取时区
-TIMEZONE_AREA=$(grep -E "^TIMEZONE_AREA=" "${SYSTEM_CONFIG}" | head -1 | sed "s/.*=\"//;s/\"$//")
-
-echo "  LAN IP:    ${LAN_IP}"
-echo "  主机名:     ${HOSTNAME}"
-echo "  用户名:     ${ROOT_USERNAME}"
-echo "  密码:       ${ROOT_PASSWORD}"
-echo "  时区:       ${TIMEZONE_AREA}"
-
-# ================================================================
-# 2. 从 LEDE 源码 Makefile 中提取内核版本和固件版本
-# ================================================================
-echo "  正在提取内核版本与固件版本..."
-
-# 固件版本号（OpenWrt/LEDE 版本，如 24.10.0）
-FIRMWARE_VERSION=$(grep -E "^VERSION_CODE" "${LEDE_ROOT}/include/version.mk" 2>/dev/null | head -1 | sed "s/.*:=//;s/ //g;s/\"//g" || echo "unknown")
-
-# 若 version.mk 中未找到，尝试从 Makefile 获取
-if [ -z "${FIRMWARE_VERSION}" ] || [ "${FIRMWARE_VERSION}" = "unknown" ]; then
-    FIRMWARE_VERSION=$(grep -E " '^$" "${LEDE_ROOT}/package/kernel/linux/Makefile" 2>/dev/null | head -1 || echo "unknown")
-fi
-
-# 内核版本（从 kernel Makefile 中提取，如 6.6.58）
-KERNEL_VERSION=$(grep -E "^LINUX_VERSION" "${LEDE_ROOT}/include/kernel-version.mk" 2>/dev/null | head -1 | sed "s/.*:=//;s/ //g" || echo "unknown")
-
-# 若 kernel-version.mk 中未找到，尝试备用方式
-if [ -z "${KERNEL_VERSION}" ] || [ "${KERNEL_VERSION}" = "unknown" ]; then
-    KERNEL_VERSION=$(make -C "${LEDE_ROOT}" kernelrelease 2>/dev/null || echo "unknown")
-fi
-
-# 目标架构
-TARGET_ARCH="x86_64"
-
-# 编译日期
-BUILD_DATE=$(TZ="${TIMEZONE_AREA:-Asia/Shanghai}" date "+%Y-%m-%d %H:%M:%S")
-
-echo "  固件版本:   ${FIRMWARE_VERSION}"
-echo "  内核版本:   ${KERNEL_VERSION}"
-echo "  编译日期:   ${BUILD_DATE}"
-
-# ================================================================
-# 3. 从 .config 中提取已安装的插件清单
-#    筛选所有 CONFIG_PACKAGE_luci-app_* = y 的条目
-# ================================================================
-echo "  正在提取已安装插件清单..."
-
-# 编译后的 .config 文件路径
-COMPILED_CONFIG="${LEDE_ROOT}/.config"
-
-# 插件清单临时文件
-PLUGIN_LIST_FILE="${REPO_ROOT}/plugin_list.tmp"
-
-# 清空临时文件
-> "${PLUGIN_LIST_FILE}"
-
-if [ -f "${COMPILED_CONFIG}" ]; then
-    # 提取所有已启用的 luci-app 插件，并格式化为可读名称
-    while IFS= read -r line; do
-        # 提取包名：CONFIG_PACKAGE_luci-app-xxx=y -> luci-app-xxx
-        pkg_name=$(echo "${line}" | sed -E 's/^CONFIG_PACKAGE_(luci-app-[a-zA-Z0-9_-]+)=y$/\1/')
-        if [ -n "${pkg_name}" ] && [ "${pkg_name}" != "${line}" ]; then
-            echo "${pkg_name}" >> "${PLUGIN_LIST_FILE}"
-        fi
-    done < "${COMPILED_CONFIG}"
-
-    # 额外提取部分非 luci-app 的核心组件
-    # smartdns、adguardhome 等后端程序
-    for core_pkg in smartdns adguardhome mwan3 nlbwmon easytier ddnsto; do
-        if grep -q "^CONFIG_PACKAGE_${core_pkg}=y" "${COMPILED_CONFIG}" 2>/dev/null; then
-            echo "${core_pkg}" >> "${PLUGIN_LIST_FILE}"
-        fi
-    done
-
-    # 去重并排序
-    sort -u "${PLUGIN_LIST_FILE}" -o "${PLUGIN_LIST_FILE}"
-fi
-
-# 统计插件数量
-PLUGIN_COUNT=$(wc -l < "${PLUGIN_LIST_FILE}" | tr -d ' ')
-echo "  已安装插件数量: ${PLUGIN_COUNT}"
-
-# 生成插件清单 Markdown 格式（每行一个插件，以 - 开头）
-PLUGIN_MARKDOWN=""
-while IFS= read -r pkg; do
-    PLUGIN_MARKDOWN+="- ${pkg}"$'\n'
-done < "${PLUGIN_LIST_FILE}"
-
-# 清理临时文件
-rm -f "${PLUGIN_LIST_FILE}"
-
-# ================================================================
-# 4. 提取主题信息
-# ================================================================
-THEME_INFO="luci-theme-argon（Argon，已设为默认主题）"
-
-# ================================================================
-# 5. 依据模板生成 Release Markdown 正文
-# ================================================================
+# ==============================================================================
+# 路径与文件常量
+# ==============================================================================
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+OPENWRT_DIR="${REPO_ROOT}/openwrt"
+SYSTEM_CONFIG="${SCRIPT_DIR}/system_config.sh"
+CONFIG_FILE="${REPO_ROOT}/config/.config"
 TEMPLATE_FILE="${REPO_ROOT}/docs/release_template.md"
 
-echo "  正在依据模板生成 Release 正文..."
+# ==============================================================================
+# 工具函数：从 system_config.sh 中解析变量值（不执行脚本，仅 grep 提取）
+# 用法：extract_var <变量名>
+# 支持三种赋值语法：VAR="value"、VAR='value'、VAR=value
+# ==============================================================================
+extract_var() {
+    local var="$1"
+    grep -E "^${var}=" "${SYSTEM_CONFIG}" 2>/dev/null | head -1 | \
+        sed -E "s/^${var}=\"([^\"]*)\".*$/\1/" | \
+        sed -E "s/^${var}='([^']*)'.*$/\1/" | \
+        sed -E "s/^${var}=([^#]*?)\s*(#.*)?$/\1/"
+}
 
-if [ ! -f "${TEMPLATE_FILE}" ]; then
-    echo "[错误] 模板文件不存在: ${TEMPLATE_FILE}"
-    exit 1
+# ==============================================================================
+# 读取系统配置参数（从 system_config.sh 顶部参数区解析）
+# ==============================================================================
+LAN_IP=$(extract_var LAN_IP)
+HOST_NAME=$(extract_var HOST_NAME)
+LOGIN_USER=$(extract_var LOGIN_USER)
+LOGIN_PASSWORD=$(extract_var LOGIN_PASSWORD)
+
+# 提供默认值，避免空值
+LAN_IP="${LAN_IP:-192.168.1.1}"
+HOST_NAME="${HOST_NAME:-OpenWrt}"
+LOGIN_USER="${LOGIN_USER:-root}"
+LOGIN_PASSWORD="${LOGIN_PASSWORD:-password}"
+
+# ==============================================================================
+# 读取内核版本（从 LEDE 源码 include/kernel-version.mk）
+# ==============================================================================
+KERNEL_VERSION="未知"
+if [ -f "${OPENWRT_DIR}/include/kernel-version.mk" ]; then
+    # kernel-version.mk 中 LINUX_VERSION 定义内核版本号
+    KV=$(grep -E "^LINUX_VERSION[[:space:]]*[:?]?=" "${OPENWRT_DIR}/include/kernel-version.mk" 2>/dev/null | \
+         head -1 | sed -E 's/.*=\s*//' | tr -d '"' | tr -d "'" | sed 's/[[:space:]]*$//')
+    [ -n "${KV}" ] && KERNEL_VERSION="${KV}"
 fi
 
-# 读取模板内容
-TEMPLATE_CONTENT=$(cat "${TEMPLATE_FILE}")
+# ==============================================================================
+# 读取固件版本（从 LEDE 源码 git 信息）
+# ==============================================================================
+FIRMWARE_VERSION="未知"
+if [ -d "${OPENWRT_DIR}/.git" ]; then
+    # 优先使用 tag，无 tag 则使用 commit hash + 日期
+    FIRMWARE_VERSION=$(cd "${OPENWRT_DIR}" && git describe --tags --always 2>/dev/null || \
+                       git log -1 --format='%h %ci' 2>/dev/null || echo "未知")
+fi
 
-# 生成最终 Markdown（替换模板中的占位符）
-# 使用 cat 配合 heredoc，将模板中的占位符替换为实际值
-# 注意：使用双引号确保 ${PLUGIN_MARKDOWN} 中的换行符被保留
-cat > "${OUTPUT_FILE}" <<EOF
-$(echo "${TEMPLATE_CONTENT}" | \
-    sed "s|{{FIRMWARE_VERSION}}|${FIRMWARE_VERSION}|g" | \
-    sed "s|{{KERNEL_VERSION}}|${KERNEL_VERSION}|g" | \
-    sed "s|{{TARGET_ARCH}}|${TARGET_ARCH}|g" | \
-    sed "s|{{BUILD_DATE}}|${BUILD_DATE}|g" | \
-    sed "s|{{LAN_IP}}|${LAN_IP}|g" | \
-    sed "s|{{HOSTNAME}}|${HOSTNAME}|g" | \
-    sed "s|{{ROOT_USERNAME}}|${ROOT_USERNAME}|g" | \
-    sed "s|{{ROOT_PASSWORD}}|${ROOT_PASSWORD}|g" | \
-    sed "s|{{TIMEZONE}}|${TIMEZONE_AREA}|g" | \
-    sed "s|{{THEME_INFO}}|${THEME_INFO}|g" | \
-    sed "s|{{PLUGIN_COUNT}}|${PLUGIN_COUNT}|g")
-EOF
+# 编译日期
+BUILD_DATE=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date '+%Y-%m-%d %H:%M:%S')
 
-# 替换插件清单占位符（因 sed 不便处理多行替换，改用 awk）
-# 将 {{PLUGIN_LIST}} 占位符替换为实际插件清单
-awk -v placeholder="{{PLUGIN_LIST}}" -v replacement="${PLUGIN_MARKDOWN}" '
-{
-    gsub(placeholder, replacement)
-    print
+# ==============================================================================
+# 读取 LEDE commit 信息（步骤 5 中生成）
+# ==============================================================================
+LEDE_COMMIT="未知"
+if [ -f "${OPENWRT_DIR}/LEDE_COMMIT_INFO.txt" ]; then
+    LEDE_COMMIT=$(cat "${OPENWRT_DIR}/LEDE_COMMIT_INFO.txt" | tr '\n' ' ')
+fi
+
+# ==============================================================================
+# 读取已安装插件清单（从 config/.config 中提取 CONFIG_PACKAGE_*=y 的行）
+# 每行展示一个插件，方便使用者快速查阅
+# ==============================================================================
+generate_package_list() {
+    if [ ! -f "${CONFIG_FILE}" ]; then
+        echo "（未找到 config/.config 配置文件）"
+        return
+    fi
+    # 提取 =y 的 CONFIG_PACKAGE_ 行，去掉 CONFIG_PACKAGE_ 前缀与 =y 后缀
+    # 仅保留 luci-app-* / luci-theme-* / luci-proto-* / luci-* 等用户可见组件，
+    # 以及常见独立服务（adguardhome、smartdns、ddnsto、easytier 等）
+    grep -E "^CONFIG_PACKAGE_" "${CONFIG_FILE}" | grep "=y$" | \
+        sed -E 's/^CONFIG_PACKAGE_([^=]*)=y.*$/\1/' | \
+        grep -E "^(luci-|smartdns|adguardhome|ddnsto|easytier|turboacc|natflow|mwan3|nlbwmon|kmod-.*(usb|e1000|igb|ixgbe|r8169|8139|net|rtl8152|asix)|oaf)" | \
+        sort -u
 }
-' "${OUTPUT_FILE}" > "${OUTPUT_FILE}.tmp" && mv "${OUTPUT_FILE}.tmp" "${OUTPUT_FILE}"
 
-echo ""
-echo "=========================================="
-echo "  Release 信息生成完成！"
-echo "  输出文件: ${OUTPUT_FILE}"
-echo "=========================================="
+PACKAGES=$(generate_package_list)
+
+# ==============================================================================
+# 输出 Release markdown 正文
+# 优先使用模板（替换占位符），无模板时输出默认格式
+# --------------------------------------------------------------------------------
+# 实现说明：使用 bash 参数扩展 ${var//pattern/replacement} 替换占位符，
+#           避免 sed 在替换多行 PACKAGES 内容时因换行符导致命令异常中断，
+#           同时规避 sed/awk 对 & / \ 等特殊字符的解析问题。
+# ==============================================================================
+if [ -f "${TEMPLATE_FILE}" ]; then
+    # 逐行读取模板，对每行执行占位符替换后输出
+    # 支持多行内容（如 {{PACKAGES}}）安全替换
+    while IFS= read -r line || [ -n "${line}" ]; do
+        line="${line//\{\{LAN_IP\}\}/${LAN_IP}}"
+        line="${line//\{\{HOST_NAME\}\}/${HOST_NAME}}"
+        line="${line//\{\{LOGIN_USER\}\}/${LOGIN_USER}}"
+        line="${line//\{\{LOGIN_PASSWORD\}\}/${LOGIN_PASSWORD}}"
+        line="${line//\{\{KERNEL_VERSION\}\}/${KERNEL_VERSION}}"
+        line="${line//\{\{FIRMWARE_VERSION\}\}/${FIRMWARE_VERSION}}"
+        line="${line//\{\{BUILD_DATE\}\}/${BUILD_DATE}}"
+        line="${line//\{\{LEDE_COMMIT\}\}/${LEDE_COMMIT}}"
+        line="${line//\{\{PACKAGES\}\}/${PACKAGES}}"
+        printf '%s\n' "${line}"
+    done < "${TEMPLATE_FILE}"
+else
+    # 无模板时输出默认格式
+    cat <<EOF
+# OpenWrt X86_64 固件发布
+
+## 固件信息
+- 编译日期：${BUILD_DATE}
+- 固件版本：${FIRMWARE_VERSION}
+- LEDE 源码：${LEDE_COMMIT}
+- 内核版本：${KERNEL_VERSION}
+- 目标架构：X86_64
+- 镜像格式：squashfs combined
+- overlay 分区：2G 可写空间
+
+## 后台登录信息
+- LAN IP：${LAN_IP}
+- 主机名：${HOST_NAME}
+- 用户名：${LOGIN_USER}
+- 密码：${LOGIN_PASSWORD}
+
+## 已安装插件清单
+${PACKAGES}
+EOF
+fi
