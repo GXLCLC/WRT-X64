@@ -37,3 +37,6 @@ Thumbs.db
 # 临时下载缓存
 dl/
 feeds/
+
+# Trae IDE 上传目录（用于截图诊断，不入库）
+.uploads/

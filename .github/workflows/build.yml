@@ -23,6 +23,13 @@ on:
       - 'scripts/**'
       - '.github/workflows/build.yml'
 
+# ★ 关键：声明 GITHUB_TOKEN 所需权限
+# GitHub 自 2023 起默认 GITHUB_TOKEN 为最小权限，必须显式声明 contents: write
+# 否则创建 Release 时会返回 403 "Resource not accessible by integration"
+permissions:
+  contents: write   # 创建 Release、推送 tag 所必需
+  actions: read     # 读取 workflow 元信息
+
 # 工作流全局环境变量（仅声明通用调度参数，不包含插件源与系统参数）
 env:
   # LEDE 源码仓库地址
