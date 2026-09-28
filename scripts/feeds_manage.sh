@@ -219,89 +219,66 @@ echo ">>> 统一执行 feeds install -a（安装全部 feeds 软件包到 packag
 # --------------------------------------------------------------------------------
 # 清除代理类插件目录（仓库规则：不添加任何代理类插件）
 # LEDE 官方 packages feed 自带 ssr-plus / v2ray / shadowsocksr 等代理包，
-# feeds install -a 会把它们装到 package/ 下；make defconfig 可能因依赖链
-# 自动启用，导致编译失败。这里从 package/ 目录物理删除，彻底杜绝。
+# feeds install -a 会把它们装到 package/feeds/<feed>/ 下；
+# make defconfig 可能因依赖链自动启用，导致编译失败或固件含代理插件。
+# 这里从 package/feeds/ 目录按包名物理删除，彻底杜绝。
 # --------------------------------------------------------------------------------
-PROXY_PKG_DIRS=(
-    "package/luci-app-ssr-plus"
-    "package/luci-app-ssr-plus_INCLUDE_Shadowsocks"
-    "package/luci-app-ssr-plus_INCLUDE_V2ray"
-    "package/luci-app-ssr-plus_INCLUDE_Xray"
-    "package/luci-app-ssr-plus_INCLUDE_Trojan"
-    "package/luci-app-ssr-plus_INCLUDE_NaiveProxy"
-    "package/luci-app-ssr-plus_INCLUDE_Hysteria2"
-    "package/luci-app-ssr-plus_INCLUDE_Kcptun"
-    "package/luci-app-ssr-plus_INCLUDE_Redsocks2"
-    "package/luci-app-ssr-plus_INCLUDE_ShadowSocks"
-    "package/luci-app-ssr-plus_INCLUDE_ShadowSocksR"
-    "package/luci-app-shadowsocks-libev"
-    "package/luci-app-shadowsocksr-libev"
-    "package/luci-app-trojan"
-    "package/luci-app-hysteria"
-    "package/luci-app-hysteria2"
-    "package/luci-app-openvpn"
-    "package/shadowsocks-libev"
-    "package/shadowsocksr-libev"
-    "package/v2ray-core"
-    "package/v2ray-geoip"
-    "package/v2ray-geosite"
-    "package/xray-core"
-    "package/trojan"
-    "package/naiveproxy"
-    "package/hysteria"
-    "package/hysteria2"
-    "package/kcptun-client"
-    "package/kcptun-server"
-    "package/redsocks2"
-    "package/microsocks"
-    "package/openvpn"
-    "package/openvpn-openssl"
-)
-# 同时清理 feeds/ 下的代理包源，避免被重新 install
-PROXY_FEED_DIRS=(
-    "packages/luci-app-ssr-plus"
-    "packages/luci-app-shadowsocks-libev"
-    "packages/luci-app-shadowsocksr-libev"
-    "packages/luci-app-trojan"
-    "packages/luci-app-openvpn"
-    "packages/shadowsocks-libev"
-    "packages/shadowsocksr-libev"
-    "packages/v2ray-core"
-    "packages/v2ray-geoip"
-    "packages/v2ray-geosite"
-    "packages/xray-core"
-    "packages/trojan"
-    "packages/naiveproxy"
-    "packages/hysteria"
-    "packages/hysteria2"
-    "packages/kcptun-client"
-    "packages/kcptun-server"
-    "packages/redsocks2"
-    "packages/microsocks"
-    "packages/openvpn"
-    "packages/openvpn-openssl"
-    "packages/tproxy"
-    "packages/iptables2socks"
+# 代理包名清单（仅包名，不含路径；用 find 匹配 package/feeds/*/ 下的目录）
+PROXY_PKG_NAMES=(
+    "luci-app-ssr-plus"
+    "luci-app-shadowsocks-libev"
+    "luci-app-shadowsocksr-libev"
+    "luci-app-trojan"
+    "luci-app-hysteria"
+    "luci-app-hysteria2"
+    "luci-app-openvpn"
+    "shadowsocks-libev"
+    "shadowsocksr-libev"
+    "v2ray-core"
+    "v2ray-geoip"
+    "v2ray-geosite"
+    "xray-core"
+    "trojan"
+    "naiveproxy"
+    "hysteria"
+    "hysteria2"
+    "kcptun-client"
+    "kcptun-server"
+    "redsocks2"
+    "microsocks"
+    "openvpn"
+    "openvpn-openssl"
+    "ipt2socks"
+    "simple-obfs"
+    "v2ray-plugin"
+    "xray-plugin"
+    "brook"
+    "chinadns-ng"
+    "dns2socks"
+    "tcping"
 )
 
 echo ""
-echo ">>> 清除 package/ 下的代理类插件目录（防止 make defconfig 自动启用）"
+echo ">>> 清除 package/feeds/ 下的代理类插件目录（防止 make defconfig 自动启用）"
 removed=0
-for dir in "${PROXY_PKG_DIRS[@]}"; do
-    if [ -d "${dir}" ]; then
-        rm -rf "${dir}"
-        echo "    已删除：${dir}"
+# feeds install 会把包以符号链接或目录形式放在 package/feeds/<feed_name>/<pkg>
+# 同时清理 feeds/<feed_name>/<pkg> 源目录（防止 update 时重新出现）
+for pkg in "${PROXY_PKG_NAMES[@]}"; do
+    # 清理 package/feeds/*/<pkg>（已安装的包）
+    found=$(find package/feeds -maxdepth 2 -type d -name "${pkg}" 2>/dev/null || true)
+    if [ -n "${found}" ]; then
+        echo "${found}" | while read -r dir; do
+            rm -rf "${dir}"
+            echo "    已删除：${dir}"
+        done
         removed=$((removed + 1))
     fi
-done
-echo "    共清除 ${removed} 个代理包目录"
-
-echo ">>> 清除 feeds/ 下的代理包源（防止 feeds install 重新拉取）"
-for dir in "${PROXY_FEED_DIRS[@]}"; do
-    if [ -d "${dir}" ]; then
+    # 清理 feeds/*/<pkg>（源目录）
+    find feeds -maxdepth 2 -type d -name "${pkg}" 2>/dev/null | while read -r dir; do
         rm -rf "${dir}"
-    fi
+    done
 done
+echo "    共清除 ${removed} 类代理包"
 
 # --------------------------------------------------------------------------------
 # 输出已注册的 feeds 列表，便于确认

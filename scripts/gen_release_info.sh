@@ -52,11 +52,21 @@ LOGIN_USER="${LOGIN_USER:-root}"
 LOGIN_PASSWORD="${LOGIN_PASSWORD:-password}"
 
 # ==============================================================================
-# 读取内核版本（从 LEDE 源码 include/kernel-version.mk）
+# 读取内核版本（从 LEDE 源码 include/kernel-version.mk 或 .config）
 # ==============================================================================
 KERNEL_VERSION="未知"
-if [ -f "${OPENWRT_DIR}/include/kernel-version.mk" ]; then
-    # kernel-version.mk 中 LINUX_VERSION 定义内核版本号
+# 优先从 .config 中读取（make defconfig 后会写入 CONFIG_LINUX_*_VERSION）
+if [ -f "${OPENWRT_DIR}/.config" ]; then
+    KV_MAJOR=$(grep -E "^CONFIG_LINUX_KERNEL_MAJOR_VERSION=" "${OPENWRT_DIR}/.config" 2>/dev/null | head -1 | cut -d= -f2 | tr -d '"')
+    KV_MINOR=$(grep -E "^CONFIG_LINUX_KERNEL_MINOR_VERSION=" "${OPENWRT_DIR}/.config" 2>/dev/null | head -1 | cut -d= -f2 | tr -d '"')
+    KV_PATCH=$(grep -E "^CONFIG_LINUX_KERNEL_PATCH=" "${OPENWRT_DIR}/.config" 2>/dev/null | head -1 | cut -d= -f2 | tr -d '"')
+    if [ -n "${KV_MAJOR}" ] && [ -n "${KV_MINOR}" ]; then
+        KERNEL_VERSION="${KV_MAJOR}.${KV_MINOR}"
+        [ -n "${KV_PATCH}" ] && KERNEL_VERSION="${KERNEL_VERSION}.${KV_PATCH}"
+    fi
+fi
+# 兜底：从 include/kernel-version.mk 读取
+if [ "${KERNEL_VERSION}" = "未知" ] && [ -f "${OPENWRT_DIR}/include/kernel-version.mk" ]; then
     KV=$(grep -E "^LINUX_VERSION[[:space:]]*[:?]?=" "${OPENWRT_DIR}/include/kernel-version.mk" 2>/dev/null | \
          head -1 | sed -E 's/.*=\s*//' | tr -d '"' | tr -d "'" | sed 's/[[:space:]]*$//')
     [ -n "${KV}" ] && KERNEL_VERSION="${KV}"
@@ -86,18 +96,19 @@ fi
 # ==============================================================================
 # 读取已安装插件清单（从 config/.config 中提取 CONFIG_PACKAGE_*=y 的行）
 # 每行展示一个插件，方便使用者快速查阅
+# 注意：仅输出用户可见的 LuCI 应用与核心服务包，
+#       不输出 kmod-* 内核驱动、lib-* 库依赖等底层包（用户不需要关心）
 # ==============================================================================
 generate_package_list() {
     if [ ! -f "${CONFIG_FILE}" ]; then
         echo "（未找到 config/.config 配置文件）"
         return
     fi
-    # 提取 =y 的 CONFIG_PACKAGE_ 行，去掉 CONFIG_PACKAGE_ 前缀与 =y 后缀
-    # 仅保留 luci-app-* / luci-theme-* / luci-proto-* / luci-* 等用户可见组件，
-    # 以及常见独立服务（adguardhome、smartdns、ddnsto、easytier 等）
+    # 提取 =y 的 CONFIG_PACKAGE_ 行，去掉前缀与后缀
+    # 白名单：仅输出用户指定的插件（及其 LuCI 界面对应包），不输出依赖与驱动
     grep -E "^CONFIG_PACKAGE_" "${CONFIG_FILE}" | grep "=y$" | \
         sed -E 's/^CONFIG_PACKAGE_([^=]*)=y.*$/\1/' | \
-        grep -E "^(luci-|smartdns|adguardhome|ddnsto|easytier|turboacc|natflow|mwan3|nlbwmon|kmod-.*(usb|e1000|igb|ixgbe|r8169|8139|net|rtl8152|asix)|oaf)" | \
+        grep -E "^(luci-theme-argon|luci-app-argon-config|smartdns|luci-app-smartdns|adguardhome|luci-app-adguardhome|ddnsto|luci-app-ddnsto|easytier|luci-app-easytier|turboacc|luci-app-turboacc|mwan3|luci-app-mwan3|nlbwmon|luci-app-nlbwmon|oaf|luci-app-oaf)$" | \
         sort -u
 }
 

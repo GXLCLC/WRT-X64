@@ -69,7 +69,7 @@ set_shadow_password() {
 # 步骤 1：修改 LAN 口 IP 地址
 # 在 config_generate 中将默认 LAN IP 替换为自定义 IP
 # ==============================================================================
-echo ">>> [1/5] 修改 LAN 口 IP 地址为：${LAN_IP}"
+echo ">>> [1/6] 修改 LAN 口 IP 地址为：${LAN_IP}"
 if [ -f "${CONFIG_GENERATE}" ]; then
     # config_generate 中默认 LAN IP 为 192.168.1.1
     sed -i "s/192\.168\.1\.1/${LAN_IP}/g" "${CONFIG_GENERATE}"
@@ -80,11 +80,15 @@ fi
 
 # ==============================================================================
 # 步骤 2：修改主机名称
+# LEDE 默认主机名为 'LEDE'（非 'OpenWrt'），需同时匹配两种写法
 # ==============================================================================
-echo ">>> [2/5] 修改主机名为：${HOST_NAME}"
+echo ">>> [2/6] 修改主机名为：${HOST_NAME}"
 if [ -f "${CONFIG_GENERATE}" ]; then
-    # config_generate 中 hostname 通过 set_system_setting hostname 设置，默认值 OpenWrt
+    # LEDE config_generate 中 hostname 默认值为 'LEDE'，OpenWrt 原版为 'OpenWrt'
+    # 同时替换两种写法，确保无论源码版本如何都能生效
+    sed -i "s/hostname='LEDE'/hostname='${HOST_NAME}'/g" "${CONFIG_GENERATE}"
     sed -i "s/hostname='OpenWrt'/hostname='${HOST_NAME}'/g" "${CONFIG_GENERATE}"
+    sed -i "s/set_system_setting hostname 'LEDE'/set_system_setting hostname '${HOST_NAME}'/g" "${CONFIG_GENERATE}" 2>/dev/null || true
     sed -i "s/set_system_setting hostname 'OpenWrt'/set_system_setting hostname '${HOST_NAME}'/g" "${CONFIG_GENERATE}" 2>/dev/null || true
     echo "    主机名已写入 ${CONFIG_GENERATE}"
 fi
@@ -99,7 +103,7 @@ fi
 # OpenWrt 后台默认使用 root 账户，此处通过注释说明，
 # 并在 base-files 的 /etc/passwd 中确保 root 账户未锁定
 # ==============================================================================
-echo ">>> [3/5] 设置后台登录用户名为：${LOGIN_USER}"
+echo ">>> [3/6] 设置后台登录用户名为：${LOGIN_USER}"
 PASSWD_FILE="package/base-files/files/etc/passwd"
 mkdir -p "$(dirname "${PASSWD_FILE}")"
 if [ -f "${PASSWD_FILE}" ]; then
@@ -120,7 +124,7 @@ fi
 # 步骤 4：设置后台登录密码
 # 使用 openssl 生成 MD5 加密密码串（OpenWrt shadow 兼容 $1$ MD5 格式）
 # ==============================================================================
-echo ">>> [4/5] 设置后台登录密码"
+echo ">>> [4/6] 设置后台登录密码"
 if command -v openssl > /dev/null 2>&1; then
     ENCRYPTED_PASSWORD=$(openssl passwd -1 "${LOGIN_PASSWORD}")
     echo "    使用 openssl 生成加密密码"
@@ -135,13 +139,33 @@ echo "    登录密码已写入 ${SHADOW_FILE}"
 # ==============================================================================
 # 步骤 5：设置时区
 # ==============================================================================
-echo ">>> [5/5] 设置时区为：${TIMEZONE_DESC}"
+echo ">>> [5/6] 设置时区为：${TIMEZONE_DESC}"
 if [ -f "${CONFIG_GENERATE}" ]; then
     # config_generate 中默认时区为 UTC，set_system_setting timezone 'UTC'
     sed -i "s/'UTC'/'${TIMEZONE}'/g" "${CONFIG_GENERATE}"
     sed -i "s/'UTC, +00:00'/'${TIMEZONE_DESC}'/g" "${CONFIG_GENERATE}" 2>/dev/null || true
     echo "    时区已写入 ${CONFIG_GENERATE}"
 fi
+
+# ==============================================================================
+# 步骤 6：设置 Argon 为 LuCI 默认主题
+# 仅安装 luci-theme-argon 包不会自动切换主题，需要在 /etc/config/luci 中
+# 指定 mediaurlbase 为 /luci-static/argon 才会生效。
+# 采用 uci-defaults 脚本方式：首次启动时自动执行 uci set 命令，确保主题生效。
+# ==============================================================================
+echo ">>> [6/6] 设置 Argon 为 LuCI 默认主题"
+UCI_DEFAULTS_DIR="package/base-files/files/etc/uci-defaults"
+mkdir -p "${UCI_DEFAULTS_DIR}"
+cat > "${UCI_DEFAULTS_DIR}/99-set-argon-theme" <<'UCIEOF'
+#!/bin/sh
+# 由 system_config.sh 自动生成：首次启动时将 LuCI 默认主题设为 Argon
+uci set luci.main.mediaurlbase='/luci-static/argon'
+uci commit luci
+exit 0
+UCIEOF
+chmod +x "${UCI_DEFAULTS_DIR}/99-set-argon-theme"
+echo "    已创建 uci-defaults 脚本：${UCI_DEFAULTS_DIR}/99-set-argon-theme"
+echo "    Argon 主题将在首次启动时自动设为默认"
 
 # ==============================================================================
 # 将配置参数导出到 .system_config.env，供 gen_release_info.sh 读取
@@ -165,4 +189,5 @@ echo "    主机名:    ${HOST_NAME}"
 echo "    用户名:    ${LOGIN_USER}"
 echo "    密码:      ${LOGIN_PASSWORD}"
 echo "    时区:      ${TIMEZONE_DESC}"
+echo "    默认主题:  Argon"
 echo "========================================"
