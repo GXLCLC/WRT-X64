@@ -1,0 +1,366 @@
+# ================================================================
+# build.yml — OpenWrt LEDE 云编译主工作流
+# ----------------------------------------------------------------
+# 职责说明：
+#   本文件仅负责流水线调度（环境准备 → 拉取源码 → 调用脚本 → 编译
+#   → 打包 → 发布 Release），不硬编码任何插件源地址和系统参数。
+#   所有配置逻辑已剥离到 scripts/ 目录下独立脚本中。
+#
+#   修改插件源 → 改 scripts/feeds_manage.sh
+#   修改系统参数 → 改 scripts/system_config.sh
+#   增减编译插件 → 改 config/.config
+#   以上修改均无需改动本文件。
+# ================================================================
+
+name: OpenWrt LEDE 云编译
+
+# ----------------------------------------------------------------
+# 触发条件配置
+# ----------------------------------------------------------------
+on:
+  # 代码推送到 main 分支时触发
+  push:
+    branches:
+      - main
+    paths:
+      # 仅在以下文件变更时触发编译，避免无关提交浪费资源
+      - 'config/.config'
+      - 'scripts/**'
+      - '.github/workflows/build.yml'
+      - 'docs/release_template.md'
+  # 手动触发（在 GitHub Actions 页面点击 Run workflow）
+  workflow_dispatch:
+  # 定时触发：每周日凌晨 3:00 自动编译（北京时间）
+  schedule:
+    - cron: '0 19 * * 6'  # UTC 19:00 = 北京时间周日 03:00
+
+# ----------------------------------------------------------------
+# 环境变量定义（仅定义工作流调度参数，不含插件源和系统参数）
+# ----------------------------------------------------------------
+env:
+  # LEDE 源码仓库地址（基础源码仓库，非插件源）
+  LEDE_REPO_URL: "https://github.com/coolsnowwolf/lede"
+  # LEDE 源码分支
+  LEDE_BRANCH: "main"
+  # 编译目标架构
+  TARGET_ARCH: "x86-64"
+  # 编译线程数（使用全部可用核心）
+  BUILD_THREADS: "$(nproc)"
+  # 编译日志级别
+  BUILD_VERBOSE: "V=s"
+
+# ----------------------------------------------------------------
+# 权限配置（Release 发布需要写入权限）
+# ----------------------------------------------------------------
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # 运行环境：Ubuntu 22.04
+    runs-on: ubuntu-22.04
+
+    steps:
+      # ==============================================================
+      # 步骤 1：检出本仓库代码
+      # 目的：获取仓库内的脚本、配置文件等资源，供后续步骤调用
+      # ==============================================================
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1  # 浅克隆，仅需最新代码
+
+      # ==============================================================
+      # 步骤 2：Runner 磁盘空间扩容
+      # 目的：GitHub Actions 默认磁盘约 14GB，OpenWrt 编译需要 30GB+，
+      #       清理不必要的预装软件释放空间，避免编译过程中磁盘不足
+      # ==============================================================
+      - name: 磁盘空间扩容（清理不必要的预装组件）
+        run: |
+          echo "========== 磁盘空间扩容开始 =========="
+          echo "--- 清理前磁盘使用情况 ---"
+          df -hT /
+
+          # 删除 Android SDK、.NET、Haskell 等大型预装组件
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+
+          # 清理 Docker 镜像和容器（释放数 GB 空间）
+          sudo docker system prune -af --volumes 2>/dev/null || true
+          sudo docker image prune -af 2>/dev/null || true
+
+          # 卸载不需要的大型软件包
+          sudo -E apt-get -qq autoremove --purge >/dev/null 2>&1 || true
+          sudo -E apt-get -qq clean >/dev/null 2>&1 || true
+
+          # 清理 APT 缓存
+          sudo rm -rf /var/cache/apt/archives/*
+          sudo rm -rf /var/lib/apt/lists/*
+
+          echo "--- 清理后磁盘使用情况 ---"
+          df -hT /
+          echo "========== 磁盘空间扩容完成 =========="
+
+      # ==============================================================
+      # 步骤 3：安装编译依赖工具
+      # 目的：安装 OpenWrt 编译所需的构建工具链和库文件
+      # ==============================================================
+      - name: 安装编译依赖
+        run: |
+          echo "========== 安装编译依赖开始 =========="
+          # 更新包索引
+          sudo -E apt-get -qq update
+
+          # 安装 OpenWrt 编译所需的核心依赖
+          sudo -E apt-get -qq install -y \
+            build-essential \
+            clang \
+            flex \
+            bison \
+            g++ \
+            gawk \
+            gcc-multilib \
+            g++-multilib \
+            gettext \
+            git \
+            libncurses-dev \
+            libssl-dev \
+            python3-distutils \
+            python3-setuptools \
+            rsync \
+            unzip \
+            zlib1g-dev \
+            libelf-dev \
+            libev-dev \
+            libc-ares-dev \
+            libgmp-dev \
+            libmpfr-dev \
+            libmpc-dev \
+            swig \
+            aria2
+
+          echo "--- 依赖安装完成，验证关键工具 ---"
+          git --version
+          make --version | head -1
+          gcc --version | head -1
+          echo "========== 编译依赖安装完成 =========="
+
+      # ==============================================================
+      # 步骤 4：缓存 LEDE 源码（加速重复编译）
+      # 目的：使用 actions/cache 缓存 LEDE 源码目录，避免每次全量克隆
+      # ==============================================================
+      - name: 缓存 LEDE 源码
+        uses: actions/cache@v4
+        with:
+          path: |
+            lede
+            lede/feeds
+          # 缓存键：基于日期（每日刷新一次），restore-keys 用于部分匹配
+          key: lede-source-cache-${{ github.run_id }}
+          restore-keys: |
+            lede-source-cache-
+
+      # ==============================================================
+      # 步骤 5：拉取 LEDE 最新源码
+      # 目的：克隆 coolsnowwolf/lede 仓库到 lede/ 目录
+      #       若缓存命中则执行增量更新，否则全量克隆
+      # ==============================================================
+      - name: 拉取 LEDE 最新源码
+        run: |
+          echo "========== 拉取 LEDE 源码 =========="
+          # 设置 LEDE_ROOT 环境变量，供后续脚本使用
+          echo "LEDE_ROOT=${{ github.workspace }}/lede" >> $GITHUB_ENV
+
+          if [ -d "lede/.git" ]; then
+            # 缓存命中：执行增量更新
+            echo "--- 检测到缓存源码，执行增量更新 ---"
+            cd lede
+            git fetch --all
+            git reset --hard origin/${{ env.LEDE_BRANCH }}
+            git pull --no-rebase
+            cd ..
+          else
+            # 缓存未命中：全量浅克隆
+            echo "--- 未检测到缓存，执行全量克隆 ---"
+            git clone --depth 1 -b ${{ env.LEDE_BRANCH }} ${{ env.LEDE_REPO_URL }} lede
+          fi
+
+          echo "--- LEDE 源码信息 ---"
+          cd lede
+          git log -1 --format="提交: %H%n作者: %an%n日期: %ci%n说明: %s"
+          cd ..
+
+          # 链接 dl 目录到工作区（便于缓存下载文件）
+          mkdir -p ${{ github.workspace }}/dl
+          ln -sf ${{ github.workspace }}/dl lede/dl
+          echo "========== LEDE 源码拉取完成 =========="
+
+      # ==============================================================
+      # 步骤 6：缓存下载文件（dl 目录）
+      # 目的：缓存编译过程中下载的源码包，避免重复下载
+      # ==============================================================
+      - name: 缓存下载文件（dl 目录）
+        uses: actions/cache@v4
+        with:
+          path: dl
+          key: dl-cache-${{ github.run_id }}
+          restore-keys: |
+            dl-cache-
+
+      # ==============================================================
+      # 步骤 7：配置系统参数
+      # 目的：调用 system_config.sh 修改 LAN IP、主机名、密码、主题等
+      #       所有系统参数逻辑在脚本内，工作流不硬编码任何参数
+      # ==============================================================
+      - name: 配置系统参数（LAN IP / 主机名 / 密码 / 主题）
+        run: |
+          echo "========== 配置 OpenWrt 系统参数 =========="
+          chmod +x scripts/system_config.sh
+          bash scripts/system_config.sh
+
+      # ==============================================================
+      # 步骤 8：管理第三方插件源
+      # 目的：调用 feeds_manage.sh 稀疏克隆第三方插件、更新安装 feeds
+      #       所有插件源地址在脚本内，工作流不硬编码任何插件源
+      # ==============================================================
+      - name: 管理第三方插件源（稀疏克隆 + feeds 更新）
+        run: |
+          echo "========== 管理第三方插件源 =========="
+          chmod +x scripts/feeds_manage.sh
+          bash scripts/feeds_manage.sh
+
+      # ==============================================================
+      # 步骤 9：部署编译配置文件
+      # 目的：将仓库 config/.config 复制到 LEDE 源码根目录
+      #       使用者通过修改此文件增减插件
+      # ==============================================================
+      - name: 部署编译配置文件（.config）
+        run: |
+          echo "========== 部署编译配置 =========="
+          cp -f config/.config lede/.config
+          echo "已将 config/.config 复制到 lede/.config"
+          echo "--- .config 文件大小 ---"
+          wc -l lede/.config
+
+      # ==============================================================
+      # 步骤 10：生成完整配置（make defconfig）
+      # 目的：根据种子配置自动补全依赖项，生成完整 .config
+      # ==============================================================
+      - name: 生成完整编译配置（make defconfig）
+        run: |
+          echo "========== 执行 make defconfig =========="
+          cd lede
+          make defconfig
+          echo "--- defconfig 完成，已启用包数量 ---"
+          grep -c "=y" .config || echo "0"
+          cd ..
+
+      # ==============================================================
+      # 步骤 11：下载编译所需源码包
+      # 目的：预下载所有 DL 源码包，使用多线程加速
+      # ==============================================================
+      - name: 下载编译源码包（make download）
+        run: |
+          echo "========== 下载编译源码包 =========="
+          cd lede
+          # 使用多线程下载，-j16 提高并行度
+          make download -j16
+          cd ..
+          echo "========== 源码包下载完成 =========="
+
+      # ==============================================================
+      # 步骤 12：编译固件
+      # 目的：执行完整编译，使用全部 CPU 核心
+      # 注意：编译出错时直接终止工作流（set -e + GitHub Actions 默认行为）
+      # ==============================================================
+      - name: 编译固件（make 编译）
+        run: |
+          echo "========== 开始编译固件 =========="
+          cd lede
+          echo "--- 编译线程数: $(nproc) ---"
+          echo "--- 开始时间: $(date '+%Y-%m-%d %H:%M:%S') ---"
+          # 使用全部核心编译，V=s 输出详细日志便于排查
+          # 不使用 -k 标志：编译出错立即终止，符合"错误终止"要求
+          make -j$(nproc) V=s
+          echo "--- 编译结束时间: $(date '+%Y-%m-%d %H:%M:%S') ---"
+          echo "========== 固件编译完成 =========="
+          cd ..
+
+      # ==============================================================
+      # 步骤 13：生成 Release 发布信息
+      # 目的：调用 gen_release_info.sh 读取系统配置、内核版本、
+      #       插件清单，依据模板生成 Release 页面 Markdown 正文
+      # ==============================================================
+      - name: 生成 Release 发布信息
+        run: |
+          echo "========== 生成 Release 信息 =========="
+          chmod +x scripts/gen_release_info.sh
+          bash scripts/gen_release_info.sh
+          echo "--- Release 信息预览 ---"
+          cat release_info.md
+
+      # ==============================================================
+      # 步骤 14：整理编译产物
+      # 目的：从 bin/ 目录中筛选 IMG 镜像文件，整理到统一目录
+      #       仅保留 .img/.img.gz 文件，不输出 VHDX/VMDK 等格式
+      # ==============================================================
+      - name: 整理编译产物（仅保留 IMG 镜像）
+        run: |
+          echo "========== 整理编译产物 =========="
+          # 创建产物输出目录
+          mkdir -p firmware
+
+          # 查找并复制所有 IMG 镜像文件（含 .img 和 .img.gz）
+          echo "--- 查找 IMG 镜像文件 ---"
+          find lede/bin/targets/ -type f \( -name "*.img" -o -name "*.img.gz" \) | while read -r img_file; do
+            echo "  发现镜像: ${img_file}"
+            cp -f "${img_file}" firmware/
+          done
+
+          # 同时复制 manifest 文件（记录已安装包列表）
+          find lede/bin/targets/ -type f -name "*.manifest" -exec cp -f {} firmware/ \; 2>/dev/null || true
+
+          # 复制 Release 信息文件
+          cp -f release_info.md firmware/
+
+          echo "--- 最终产物列表 ---"
+          ls -lh firmware/
+          echo "========== 产物整理完成 =========="
+
+      # ==============================================================
+      # 步骤 15：上传编译产物为 Artifact
+      # 目的：将编译产物作为 Artifact 上传，便于未发布前下载检查
+      # ==============================================================
+      - name: 上传编译产物（Artifact）
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-x86-64-firmware
+          path: firmware/
+          retention-days: 7  # 保留 7 天
+          if-no-files-found: error  # 无文件时报错（说明编译可能失败）
+
+      # ==============================================================
+      # 步骤 16：发布 GitHub Release
+      # 目的：编译成功后自动创建 Release，上传 IMG 镜像并填充信息
+      #       Release 正文使用 gen_release_info.sh 生成的 Markdown
+      # ==============================================================
+      - name: 发布 GitHub Release
+        if: success()  # 仅在编译成功时执行
+        uses: softprops/action-gh-release@v2
+        with:
+          # Release 标签：基于日期和提交哈希自动生成
+          tag_name: ${{ github.run_id }}-${{ github.run_attempt }}
+          # Release 标题
+          name: OpenWrt LEDE ${{ env.TARGET_ARCH }} 固件 $(date '+%Y%m%d')
+          # Release 正文：从生成的 Markdown 文件读取
+          body_path: firmware/release_info.md
+          # 标记为预发布（可按需改为正式发布）
+          prerelease: false
+          # 上传的资产文件
+          files: |
+            firmware/*.img
+            firmware/*.img.gz
+            firmware/*.manifest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
