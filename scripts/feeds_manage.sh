@@ -217,6 +217,93 @@ echo ">>> 统一执行 feeds install -a（安装全部 feeds 软件包到 packag
 ./scripts/feeds install -a
 
 # --------------------------------------------------------------------------------
+# 清除代理类插件目录（仓库规则：不添加任何代理类插件）
+# LEDE 官方 packages feed 自带 ssr-plus / v2ray / shadowsocksr 等代理包，
+# feeds install -a 会把它们装到 package/ 下；make defconfig 可能因依赖链
+# 自动启用，导致编译失败。这里从 package/ 目录物理删除，彻底杜绝。
+# --------------------------------------------------------------------------------
+PROXY_PKG_DIRS=(
+    "package/luci-app-ssr-plus"
+    "package/luci-app-ssr-plus_INCLUDE_Shadowsocks"
+    "package/luci-app-ssr-plus_INCLUDE_V2ray"
+    "package/luci-app-ssr-plus_INCLUDE_Xray"
+    "package/luci-app-ssr-plus_INCLUDE_Trojan"
+    "package/luci-app-ssr-plus_INCLUDE_NaiveProxy"
+    "package/luci-app-ssr-plus_INCLUDE_Hysteria2"
+    "package/luci-app-ssr-plus_INCLUDE_Kcptun"
+    "package/luci-app-ssr-plus_INCLUDE_Redsocks2"
+    "package/luci-app-ssr-plus_INCLUDE_ShadowSocks"
+    "package/luci-app-ssr-plus_INCLUDE_ShadowSocksR"
+    "package/luci-app-shadowsocks-libev"
+    "package/luci-app-shadowsocksr-libev"
+    "package/luci-app-trojan"
+    "package/luci-app-hysteria"
+    "package/luci-app-hysteria2"
+    "package/luci-app-openvpn"
+    "package/shadowsocks-libev"
+    "package/shadowsocksr-libev"
+    "package/v2ray-core"
+    "package/v2ray-geoip"
+    "package/v2ray-geosite"
+    "package/xray-core"
+    "package/trojan"
+    "package/naiveproxy"
+    "package/hysteria"
+    "package/hysteria2"
+    "package/kcptun-client"
+    "package/kcptun-server"
+    "package/redsocks2"
+    "package/microsocks"
+    "package/openvpn"
+    "package/openvpn-openssl"
+)
+# 同时清理 feeds/ 下的代理包源，避免被重新 install
+PROXY_FEED_DIRS=(
+    "packages/luci-app-ssr-plus"
+    "packages/luci-app-shadowsocks-libev"
+    "packages/luci-app-shadowsocksr-libev"
+    "packages/luci-app-trojan"
+    "packages/luci-app-openvpn"
+    "packages/shadowsocks-libev"
+    "packages/shadowsocksr-libev"
+    "packages/v2ray-core"
+    "packages/v2ray-geoip"
+    "packages/v2ray-geosite"
+    "packages/xray-core"
+    "packages/trojan"
+    "packages/naiveproxy"
+    "packages/hysteria"
+    "packages/hysteria2"
+    "packages/kcptun-client"
+    "packages/kcptun-server"
+    "packages/redsocks2"
+    "packages/microsocks"
+    "packages/openvpn"
+    "packages/openvpn-openssl"
+    "packages/tproxy"
+    "packages/iptables2socks"
+)
+
+echo ""
+echo ">>> 清除 package/ 下的代理类插件目录（防止 make defconfig 自动启用）"
+removed=0
+for dir in "${PROXY_PKG_DIRS[@]}"; do
+    if [ -d "${dir}" ]; then
+        rm -rf "${dir}"
+        echo "    已删除：${dir}"
+        removed=$((removed + 1))
+    fi
+done
+echo "    共清除 ${removed} 个代理包目录"
+
+echo ">>> 清除 feeds/ 下的代理包源（防止 feeds install 重新拉取）"
+for dir in "${PROXY_FEED_DIRS[@]}"; do
+    if [ -d "${dir}" ]; then
+        rm -rf "${dir}"
+    fi
+done
+
+# --------------------------------------------------------------------------------
 # 输出已注册的 feeds 列表，便于确认
 # --------------------------------------------------------------------------------
 echo ""
