@@ -83,14 +83,18 @@ jobs:
       - name: 初始化编译环境
         run: |
           set -e
+          echo ">>> 启用 universe/multiverse 源（python2.7/ecj 等包在 universe 中）"
+          sudo add-apt-repository -y universe multiverse
           echo ">>> 更新 apt 源并安装编译依赖"
           sudo apt-get update
+          # 依赖包清单说明：
+          #   - jar 不是独立 apt 包，由 fastjar 提供（fastjar 已在下方列表中）
+          #   - python2.7 在 universe 源，Ubuntu 22.04 已提供
+          #   - openssl 用于 system_config.sh 生成登录密码加密串
           sudo apt-get -y install build-essential asciidoc binutils bzip2 gawk gettext \
               git libncurses5-dev libz-dev patch python3 python2.7 unzip zlib1g-dev \
               lib32gcc-s1 libc6-dev-i386 rsync wget curl subversion ecj fastjar \
-              jar java-common sharutils
-          # openssl 用于生成登录密码加密串
-          sudo apt-get -y install openssl || true
+              java-common sharutils openssl
           echo ">>> 编译环境准备完成"
           df -h
 
