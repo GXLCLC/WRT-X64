@@ -199,6 +199,11 @@ jobs:
           set -o pipefail
           echo ">>> 生成 defconfig"
           make defconfig
+          echo ">>> defconfig 完成，校验关键配置是否生效（防止符号名错误导致配置被丢弃）"
+          echo "--- 目标平台 ---"
+          grep -E "^CONFIG_TARGET_x86" .config || echo "警告：目标平台配置缺失！"
+          echo "--- 关键插件（应为 =y）---"
+          grep -E "^CONFIG_PACKAGE_(luci-theme-argon|luci-app-argon-config|smartdns|luci-app-smartdns|adguardhome|luci-app-adguardhome|ddnsto|luci-app-ddnsto|easytier|luci-app-easytier|turboacc|luci-app-turboacc|oaf|luci-app-oaf|mwan3|luci-app-mwan3|nlbwmon|luci-app-nlbwmon)=" .config || echo "警告：部分插件配置缺失！"
           echo ">>> 预下载依赖源码（-j 控制并发）"
           # 下载失败立即终止工作流（pipefail 捕获 make 失败状态）
           make download -j${COMPILE_THREAD} V=s 2>&1 | tail -50
