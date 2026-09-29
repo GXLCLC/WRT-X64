@@ -1,13 +1,13 @@
 # ==============================================================================
-# OpenWrt 云编译主工作流
-# 仅负责流水线调度：环境准备 -> 拉取 LEDE 源码 -> 调用各独立脚本 -> 编译 -> 打包 -> 发布 Release
+# ImmortalWrt 云编译主工作流
+# 仅负责流水线调度：环境准备 -> 拉取 ImmortalWrt 源码 -> 调用各独立脚本 -> 编译 -> 扩容 -> 打包 -> 发布 Release
 # 注意：本文件禁止硬编码插件源、系统参数，所有配置逻辑均已剥离到 scripts/ 下独立脚本
 # ==============================================================================
-name: OpenWrt 云编译
+name: ImmortalWrt 云编译
 
 # 触发条件：支持手动触发，也支持修改配置/脚本后自动触发
 on:
-  # 手动触发，可在 Actions 页面输入自定义 Release 标签
+  # 手动触发
   workflow_dispatch:
     inputs:
       release_tag:
@@ -24,113 +24,109 @@ on:
       - '.github/workflows/build.yml'
 
 # ★ 关键：声明 GITHUB_TOKEN 所需权限
-# GitHub 自 2023 起默认 GITHUB_TOKEN 为最小权限，必须显式声明 contents: write
-# 否则创建 Release 时会返回 403 "Resource not accessible by integration"
+# GitHub 默认 GITHUB_TOKEN 为最小权限，创建 Release 必须显式声明 contents: write
+# 否则返回 403 "Resource not accessible by integration"
 permissions:
   contents: write   # 创建 Release、推送 tag 所必需
   actions: read     # 读取 workflow 元信息
 
 # 工作流全局环境变量（仅声明通用调度参数，不包含插件源与系统参数）
 env:
-  # LEDE 源码仓库地址
-  OPENWRT_REPO: https://github.com/coolsnowwolf/lede
-  # LEDE 源码分支
+  # ImmortalWrt 源码仓库地址
+  OPENWRT_REPO: https://github.com/immortalwrt/immortalwrt
+  # ImmortalWrt 源码分支
   OPENWRT_BRANCH: master
-  # 编译目标平台（X86_64 架构）
+  # 编译目标平台
   TARGET_PLATFORM: x86
   TARGET_SUBTARGET: '64'
-  # 编译线程数（根据 GitHub Runner 性能调整，过大易导致 OOM）
+  # 编译线程数
   COMPILE_THREAD: '2'
-  # LEDE 源码本地目录名
+  # ImmortalWrt 源码本地目录名
   OPENWRT_DIR: openwrt
+  # overlay 分区目标大小（MB），2G = 2048
+  OVERLAY_SIZE_MB: '2048'
 
-# 并发控制：同一仓库同一分支同时只允许一个编译任务运行
+# 并发控制：同一分支同时只允许一个编译任务运行
 concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
-    # 任务名称
     name: 编译 X86_64 固件
-    # 运行环境：Ubuntu 22.04
     runs-on: ubuntu-22.04
-    # 任务超时时间（分钟），避免异常卡死占用资源
-    timeout-minutes: 240
+    timeout-minutes: 360
 
     steps:
       # --------------------------------------------------------------------------
-      # 步骤 1：检出本仓库代码（包含 .config、scripts/、docs/ 等配置文件）
+      # 步骤 1：检出本仓库代码（包含 .config、scripts/、docs/ 等）
       # --------------------------------------------------------------------------
       - name: 检出本仓库代码
         uses: actions/checkout@v4
 
       # --------------------------------------------------------------------------
       # 步骤 2：扩容 Runner 磁盘空间
-      # 规避 GitHub 默认磁盘空间不足导致编译失败问题
-      # 通过删除预装的大型工具链（.NET、Android SDK、Haskell 等）释放空间
+      # 规避 GitHub 默认磁盘空间不足导致编译失败
       # --------------------------------------------------------------------------
       - name: 扩容 Runner 磁盘空间
         run: |
-          set -e
+          set -euo pipefail
           echo ">>> 清理 Runner 预装大型工具链以释放磁盘空间"
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
                       /usr/local/lib/llvm /usr/local/share/boost \
                       /usr/local/share/chrom* /opt/hostedtoolcache 2>/dev/null || true
           sudo apt-get clean
           sudo apt-get autoremove -y 2>/dev/null || true
-          # 移除可能存在的 Docker 镜像
           sudo docker image prune -af 2>/dev/null || true
           echo ">>> 当前磁盘可用空间："
           df -h
 
       # --------------------------------------------------------------------------
-      # 步骤 3：初始化编译环境（安装 OpenWrt 编译所需依赖）
+      # 步骤 3：初始化编译环境（安装 ImmortalWrt 编译所需依赖）
       # --------------------------------------------------------------------------
       - name: 初始化编译环境
         run: |
-          set -e
+          set -euo pipefail
           echo ">>> 启用 universe/multiverse 源（python2.7/ecj 等包在 universe 中）"
           sudo add-apt-repository -y universe multiverse
           echo ">>> 更新 apt 源并安装编译依赖"
           sudo apt-get update
-          # 依赖包清单说明：
-          #   - jar 不是独立 apt 包，由 fastjar 提供（fastjar 已在下方列表中）
-          #   - python2.7 在 universe 源，Ubuntu 22.04 已提供
+          # 依赖包说明：
+          #   - jar 不是独立 apt 包，由 fastjar 提供
           #   - openssl 用于 system_config.sh 生成登录密码加密串
+          #   - parted 用于 resize_overlay.sh 分区扩容
           sudo apt-get -y install build-essential asciidoc binutils bzip2 gawk gettext \
               git libncurses5-dev libz-dev patch python3 python2.7 unzip zlib1g-dev \
               lib32gcc-s1 libc6-dev-i386 rsync wget curl subversion ecj fastjar \
-              java-common sharutils openssl
+              java-common sharutils openssl parted
           echo ">>> 编译环境准备完成"
           df -h
 
       # --------------------------------------------------------------------------
-      # 步骤 4：配置 actions/cache 缓存源码与 feeds
-      # 缓存 dl/（下载源码包）与 feeds/ 目录，减少重复编译耗时
-      # 缓存键基于 .config 与 feeds_manage.sh 内容，配置变动时自动刷新缓存
+      # 步骤 4：配置 actions/cache 缓存 dl、feeds、ccache
+      # 缓存 dl/（下载源码包）、feeds/（软件包源）、ccache/（编译缓存）
+      # 不缓存 build_dir，避免增量编译冲突
+      # 缓存键基于 .config 与 feeds_manage.sh，配置变动时自动刷新
       # --------------------------------------------------------------------------
-      - name: 缓存 OpenWrt 源码与 Feeds
+      - name: 缓存 dl / feeds / ccache
         uses: actions/cache@v4
         with:
           path: |
             ${{ env.OPENWRT_DIR }}/dl
             ${{ env.OPENWRT_DIR }}/feeds
-          key: openwrt-cache-${{ hashFiles('config/.config', 'scripts/feeds_manage.sh') }}
+            ${{ env.OPENWRT_DIR }}/ccache
+          key: iwrt-cache-${{ hashFiles('config/.config', 'scripts/feeds_manage.sh') }}
           restore-keys: |
-            openwrt-cache-
+            iwrt-cache-
 
       # --------------------------------------------------------------------------
-      # 步骤 5：拉取 LEDE 最新源码
-      # 若缓存未命中则全新克隆；若缓存命中则更新到最新提交
-      # 注意：cache 步骤在本步骤之前恢复 openwrt/dl 和 openwrt/feeds，
-      #       会创建 openwrt/ 目录但没有 .git，导致 git clone 报
-      #       "destination path already exists" 错误。
-      #       处理：有 .git 则更新；无 .git 则先清空目录再克隆。
+      # 步骤 5：拉取 ImmortalWrt 最新源码
+      # cache 可能恢复 openwrt/dl、openwrt/feeds 导致 openwrt/ 目录存在但无 .git，
+      # 此时需先清空目录再克隆，避免 "destination path already exists" 错误
       # --------------------------------------------------------------------------
-      - name: 拉取 LEDE 源码
+      - name: 拉取 ImmortalWrt 源码
         run: |
-          set -e
+          set -euo pipefail
           if [ -d "${OPENWRT_DIR}/.git" ]; then
             echo ">>> 使用已有缓存源码，更新到最新提交"
             cd "${OPENWRT_DIR}"
@@ -138,120 +134,130 @@ jobs:
             git reset --hard origin/${OPENWRT_BRANCH}
             git pull --ff-only origin ${OPENWRT_BRANCH} 2>/dev/null || true
           else
-            # openwrt/ 目录可能由 cache 恢复 dl/feeds 创建，但没有 .git
-            # 必须先删除再 clone，否则 git clone 报 "destination path already exists"
             if [ -d "${OPENWRT_DIR}" ]; then
               echo ">>> openwrt/ 目录存在但无 .git（cache 恢复残留），先清空"
               rm -rf "${OPENWRT_DIR}"
             fi
-            echo ">>> 全新克隆 LEDE 源码（浅克隆以节省时间）"
+            echo ">>> 全新克隆 ImmortalWrt 源码（浅克隆）"
             git clone --depth 1 --single-branch --branch ${OPENWRT_BRANCH} ${OPENWRT_REPO} ${OPENWRT_DIR}
             cd "${OPENWRT_DIR}"
           fi
-          # 记录当前 LEDE commit 信息，供 Release 信息使用
-          git log -1 --pretty=format:'commit: %H%n日期: %ci%n说明: %s' > LEDE_COMMIT_INFO.txt
-          echo ">>> LEDE 源码信息："
-          cat LEDE_COMMIT_INFO.txt
+          # 记录 commit 信息供 Release 使用
+          git log -1 --pretty=format:'commit: %H%n日期: %ci%n说明: %s' > IWRT_COMMIT_INFO.txt
+          echo ">>> ImmortalWrt 源码信息："
+          cat IWRT_COMMIT_INFO.txt
 
       # --------------------------------------------------------------------------
-      # 步骤 6：拷贝本仓库的 .config 编译配置到 LEDE 源码根目录
-      # 使用者可在 config/.config 中勾选增减插件
+      # 步骤 6：拷贝本仓库的 .config 编译配置到 ImmortalWrt 源码根目录
       # --------------------------------------------------------------------------
       - name: 应用编译配置文件
         run: |
-          set -e
-          echo ">>> 拷贝 config/.config 到 LEDE 源码根目录"
+          set -euo pipefail
+          echo ">>> 拷贝 config/.config 到 ImmortalWrt 源码根目录"
           cp -f config/.config "${OPENWRT_DIR}/.config"
           echo ">>> 配置文件已就绪"
 
       # --------------------------------------------------------------------------
       # 步骤 7：调用独立脚本管理第三方插件源（feeds_manage.sh）
-      # 完成插件源拉取、稀疏克隆、feeds update && feeds install
-      # 工作目录为 LEDE 源码根目录，便于脚本操作 feeds.conf 等文件
+      # 完成按需稀疏克隆、feeds update -a && feeds install -a
       # --------------------------------------------------------------------------
       - name: 管理第三方插件源（feeds_manage.sh）
         working-directory: ${{ env.OPENWRT_DIR }}
         run: |
-          set -e
+          set -euo pipefail
           bash "${GITHUB_WORKSPACE}/scripts/feeds_manage.sh"
 
       # --------------------------------------------------------------------------
       # 步骤 8：调用独立脚本修改系统基础参数（system_config.sh）
-      # 修改 LAN IP、主机名、后台登录用户名、密码等
-      # 工作目录为 LEDE 源码根目录，脚本会修改 base-files 中的对应配置
+      # 修改 LAN IP、主机名、登录账号密码、默认主题
       # --------------------------------------------------------------------------
       - name: 修改系统基础参数（system_config.sh）
         working-directory: ${{ env.OPENWRT_DIR }}
         run: |
-          set -e
+          set -euo pipefail
           bash "${GITHUB_WORKSPACE}/scripts/system_config.sh"
 
       # --------------------------------------------------------------------------
       # 步骤 9：生成 defconfig 并预下载依赖源码
-      # make defconfig 自动补全 .config 缺失项；make download 提前下载，
-      # 避免编译过程中因下载中断导致编译失败
+      # make defconfig 自动补全 .config 缺失项；make download 提前下载
       # --------------------------------------------------------------------------
       - name: 生成 defconfig 并预下载依赖
         working-directory: ${{ env.OPENWRT_DIR }}
         run: |
-          set -e
-          # 启用 pipefail：管道中任一命令失败即视为整条命令失败
-          set -o pipefail
+          set -euo pipefail
           echo ">>> 生成 defconfig"
           make defconfig
-          echo ">>> defconfig 完成，校验关键配置是否生效（防止符号名错误导致配置被丢弃）"
+          echo ">>> defconfig 完成，校验关键配置是否生效"
           echo "--- 目标平台 ---"
           grep -E "^CONFIG_TARGET_x86" .config || echo "警告：目标平台配置缺失！"
           echo "--- 关键插件（应为 =y）---"
-          grep -E "^CONFIG_PACKAGE_(luci-theme-argon|luci-app-argon-config|smartdns|luci-app-smartdns|adguardhome|luci-app-adguardhome|ddnsto|luci-app-ddnsto|easytier|luci-app-easytier|turboacc|luci-app-turboacc|oaf|luci-app-oaf|mwan3|luci-app-mwan3|nlbwmon|luci-app-nlbwmon)=" .config || echo "警告：部分插件配置缺失！"
-          echo ">>> 预下载依赖源码（-j 控制并发）"
-          # 下载失败立即终止工作流（pipefail 捕获 make 失败状态）
+          grep -E "^CONFIG_PACKAGE_(luci-theme-argon|luci-app-argon-config|smartdns|luci-app-smartdns|adguardhome|luci-app-adguardhome|ddnsto|luci-app-ddnsto|easytier|luci-app-easytier|turboacc|luci-app-turboacc|oaf|luci-app-oaf|mwan3|luci-app-mwan3|nlbwmon|luci-app-nlbwmon|luci-app-openclash)=" .config || echo "警告：部分插件配置缺失！"
+          echo ">>> 预下载依赖源码"
           make download -j${COMPILE_THREAD} V=s 2>&1 | tail -50
           echo ">>> 依赖预下载完成"
 
       # --------------------------------------------------------------------------
-      # 步骤 10：编译固件
-      # 编译出现任何错误立即终止工作流（set -e + make 失败即退出）
+      # 步骤 10：make clean（清理旧构建产物，保留 toolchain 缩短增量编译）
+      # 不执行 make dirclean，避免重新编译 toolchain
+      # --------------------------------------------------------------------------
+      - name: 清理旧构建产物（make clean）
+        working-directory: ${{ env.OPENWRT_DIR }}
+        run: |
+          set -euo pipefail
+          echo ">>> 执行 make clean（清理旧产物，保留 toolchain）"
+          make clean
+          echo ">>> clean 完成"
+
+      # --------------------------------------------------------------------------
+      # 步骤 11：编译固件
+      # 编译出现任何错误立即终止工作流（set -euo pipefail + make 失败即退出）
       # --------------------------------------------------------------------------
       - name: 编译固件
         working-directory: ${{ env.OPENWRT_DIR }}
         run: |
-          set -e
-          # 启用 pipefail：管道中任一命令失败即视为整条命令失败
-          # 确保编译失败时工作流立即终止（make 失败 -> pipefail -> set -e 退出）
-          set -o pipefail
+          set -euo pipefail
           echo ">>> 开始编译 X86_64 固件（线程数 ${COMPILE_THREAD}）"
-          # 输出详细日志并保存到 build.log，便于失败时排查
           make -j${COMPILE_THREAD} V=s 2>&1 | tee build.log
-          # 校验关键产物是否存在：squashfs combined IMG 镜像
           echo ">>> 校验编译产物"
           if ! find bin/targets/${TARGET_PLATFORM}/${TARGET_SUBTARGET} -name "*combined*.img*" | grep -q .; then
-            echo ">>> 错误：未找到 squashfs combined IMG 镜像产物，编译失败"
+            echo ">>> 错误：未找到 squashfs combined IMG 镜像，编译失败"
             exit 1
           fi
           echo ">>> 编译成功，产物列表："
           find bin/targets/${TARGET_PLATFORM}/${TARGET_SUBTARGET} -name "*.img*" -exec ls -lh {} \;
 
       # --------------------------------------------------------------------------
-      # 步骤 11：调用脚本生成 Release markdown 正文
-      # 自动读取 system_config.sh 内配置、内核版本、插件清单等
+      # 步骤 12：后置扩容 overlay 分区至 2G
+      # 调用 resize_overlay.sh 扩展 rootfs 分区，增加 overlay 可写空间
       # --------------------------------------------------------------------------
-      - name: 生成 Release 信息（gen_release_info.sh）
+      - name: 扩容 overlay 分区至 2G
+        working-directory: ${{ env.OPENWRT_DIR }}
         run: |
-          set -e
+          set -euo pipefail
+          echo ">>> 执行后置扩容脚本，将 overlay 分区扩容至 ${OVERLAY_SIZE_MB} MB"
+          bash "${GITHUB_WORKSPACE}/scripts/resize_overlay.sh" \
+              "bin/targets/${TARGET_PLATFORM}/${TARGET_SUBTARGET}" \
+              "${OVERLAY_SIZE_MB}"
+          echo ">>> overlay 扩容完成"
+
+      # --------------------------------------------------------------------------
+      # 步骤 13：生成 Release 信息（gen_release_info.sh）
+      # --------------------------------------------------------------------------
+      - name: 生成 Release 信息
+        run: |
+          set -euo pipefail
           bash scripts/gen_release_info.sh > release_body.md
           echo ">>> Release 正文预览："
           cat release_body.md
 
       # --------------------------------------------------------------------------
-      # 步骤 12：收集 IMG 镜像文件
-      # 仅收集 IMG 镜像，不包含 VHDX、VMDK 等其他格式镜像
+      # 步骤 14：收集 IMG 镜像文件（仅 IMG，排除 VHDX/VMDK/QCOW）
       # --------------------------------------------------------------------------
       - name: 收集 IMG 镜像文件
         run: |
-          set -e
+          set -euo pipefail
           mkdir -p artifacts
-          echo ">>> 收集 IMG 镜像（排除 VHDX/VMDK/QEMU 格式）"
+          echo ">>> 收集 IMG 镜像（排除 VHDX/VMDK/QCOW 格式）"
           find "${OPENWRT_DIR}/bin/targets/${TARGET_PLATFORM}/${TARGET_SUBTARGET}" \
               -name "*.img*" \
               ! -name "*.vmdk*" \
@@ -262,15 +268,14 @@ jobs:
           ls -lh artifacts/
 
       # --------------------------------------------------------------------------
-      # 步骤 13：发布 Release（自动在 GitHub 创建 Release 发布固件镜像）
-      # Release 正文自动填充 LAN IP、账号密码、内核版本、固件版本、插件清单
+      # 步骤 15：发布 Release（自动创建 Release 并上传固件镜像）
       # --------------------------------------------------------------------------
       - name: 发布 Release
         if: success()
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.release_tag || format('OpenWrt-X86_64-{0}', github.run_number) }}
-          name: OpenWrt X86_64 固件 #${{ github.run_number }}
+          tag_name: ${{ github.event.inputs.release_tag || format('ImmortalWrt-X86_64-{0}', github.run_number) }}
+          name: ImmortalWrt X86_64 固件 #${{ github.run_number }}
           body_path: release_body.md
           files: artifacts/*
           prerelease: false
@@ -279,7 +284,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # --------------------------------------------------------------------------
-      # 步骤 14（可选）：编译失败时上传编译日志，便于排查
+      # 步骤 16：编译失败时上传编译日志
       # --------------------------------------------------------------------------
       - name: 上传编译日志（失败时）
         if: failure()
@@ -288,5 +293,5 @@ jobs:
           name: build-log
           path: |
             ${{ env.OPENWRT_DIR }}/build.log
-            ${{ env.OPENWRT_DIR }}/LEDE_COMMIT_INFO.txt
+            ${{ env.OPENWRT_DIR }}/IWRT_COMMIT_INFO.txt
           retention-days: 7
