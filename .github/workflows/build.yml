@@ -46,6 +46,7 @@ jobs:
         uses: actions/checkout@v4
 
       # ----------------------------------------------------------
+      # ----------------------------------------------------------
       # 步骤 2：初始化编译环境
       #   a. 清理 runner 预装的无用软件，释放磁盘空间（编译约需 25G+）
       #   b. 安装 ImmortalWrt 官方要求的全量编译依赖
@@ -71,6 +72,14 @@ jobs:
             subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
           # 设置时区，保证后续 Release 时间戳正确
           sudo timedatectl set-timezone "$TZ"
+
+          # ===== 新增：清理已存在的旧 swap，避免 "Text file busy" 报错 =====
+          # 关闭当前系统占用的 swap（不存在时会静默跳过，不报错）
+          sudo swapoff -a > /dev/null 2>&1
+          # 删除残留的旧 swap 文件，确保 fallocate 能全新分配
+          sudo rm -f /swapfile
+          # ===== 新增结束 =====
+
           # 创建 8G swap（物理内存仅 7G，内核与大插件链接阶段易 OOM）
           sudo fallocate -l 8G /swapfile
           sudo chmod 600 /swapfile
