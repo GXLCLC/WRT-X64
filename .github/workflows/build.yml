@@ -10,13 +10,14 @@ on:
 
 env:
   REPO_URL: https://github.com/istoreos/istoreos.git
-  REPO_BRANCH: istoreos-24.10   # 拉取 24.10 活跃分支
+  REPO_BRANCH: istoreos-24.10   # 明确拉取 24.10 分支源码
   CONFIG_FILE: config/x86_64.config
   TZ: Asia/Shanghai
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # 明确指定使用 Ubuntu 22.04，避免 latest 升级到 24.04 导致软件包缺失
+    runs-on: ubuntu-22.04
 
     steps:
       # ===== 1. 检出当前仓库代码 =====
@@ -28,19 +29,25 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          # 释放磁盘空间，移除无用的大型文件
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          # 更新软件源列表
           sudo -E apt-get -qq update
-          sudo -E apt-get -qq install -y ack antlr3 asciidoc autoconf automake \
-            autopoint binutils bison build-essential bzip2 ccache cmake cpio \
-            curl device-tree-compiler fastjar flex gawk gettext gcc-multilib \
-            g++-multilib git gperf haveged help2man intltool libc6-dev-i386 \
-            libc6-dev-mips32 libelf-dev libglib2.0-dev libgmp-dev libltdl-dev \
-            libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev \
-            libreadline-dev libssl-dev libtool lrzsz mkisofs msmtp nano \
-            ninja-build p7zip p7zip-full patch pkgconf python2.7 python3 \
-            python3-pip python3-ply python3-docutils python3-pkg-resources \
-            qemu-utils rsync scons squashfs-tools subversion swig texinfo \
-            uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+          # 安装编译所需依赖（已适配 Ubuntu 22.04）
+          # 注意：已移除 python2.7，用 genisoimage 替换 mkisofs
+          sudo -E apt-get -qq install -y \
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+            build-essential bzip2 ccache cmake cpio curl device-tree-compiler \
+            fastjar flex gawk gettext gcc-multilib g++-multilib git gperf \
+            haveged help2man intltool libc6-dev-i386 libc6-dev-mips32 \
+            libelf-dev libglib2.0-dev libgmp-dev libltdl-dev libmpc-dev \
+            libmpfr-dev libncurses5-dev libncursesw5-dev libreadline-dev \
+            libssl-dev libtool lrzsz genisoimage msmtp nano ninja-build \
+            p7zip p7zip-full patch pkgconf python3 python3-pip python3-ply \
+            python3-docutils qemu-utils rsync scons squashfs-tools \
+            subversion swig texinfo uglifyjs upx-ucl unzip vim wget \
+            xmlto xxd zlib1g-dev
+          # 清理无用依赖，释放磁盘空间
           sudo -E apt-get -qq autoremove --purge
           sudo -E apt-get -qq clean
 
@@ -64,7 +71,7 @@ jobs:
           cd openwrt
           $GITHUB_WORKSPACE/scripts/diy-part1.sh
 
-      # ===== 6. 拉取系统配置修改脚本（独立仓库） =====
+      # ===== 6. 拉取独立的系统配置修改脚本 =====
       - name: Fetch System Config Script
         run: |
           cd openwrt
@@ -79,7 +86,7 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      # ===== 8. 执行 make defconfig 生成最终配置并验证 =====
+      # ===== 8. 生成最终配置并强制设定 Argon 主题 =====
       - name: Configure Firmware
         run: |
           cd openwrt
@@ -97,11 +104,11 @@ jobs:
           find dl -size -1024c -exec ls -l {} \;
           find dl -size -1024c -exec rm -f {} \;
 
-      # ===== 10. 执行系统配置修改脚本（独立仓库拉取） =====
+      # ===== 10. 注入系统配置修改脚本（随固件编译） =====
       - name: Apply System Config Customization
         run: |
           cd openwrt
-          # 将独立脚本复制到源码树中，在编译前生效
+          # 将独立脚本复制到源码树中，在首次启动时自动执行
           cp $GITHUB_WORKSPACE/scripts/system-config.sh package/base-files/files/etc/uci-defaults/99-custom-config.sh
           chmod +x package/base-files/files/etc/uci-defaults/99-custom-config.sh
 
@@ -130,85 +137,4 @@ jobs:
           mkdir -p $GITHUB_WORKSPACE/firmware
           # 仅复制 img.gz 文件，不生成 VHDX/VMDK
           cp -v *.img.gz $GITHUB_WORKSPACE/firmware/ 2>/dev/null || true
-          cp -v *.manifest $GITHUB_WORKSPACE/firmware/ 2>/dev/null || true
-          cp -v *.sha256sums $GITHUB_WORKSPACE/firmware/ 2>/dev/null || true
-          echo "=== Firmware files ==="
-          ls -lh $GITHUB_WORKSPACE/firmware/
-
-      # ===== 14. 提取系统信息（内核版本、固件版本） =====
-      - name: Extract System Info
-        if: steps.compile.outputs.status == 'success'
-        run: |
-          cd openwrt
-          KERNEL_VER=$(make kernelversion 2>/dev/null || echo "unknown")
-          echo "KERNEL_VERSION=$KERNEL_VER" >> $GITHUB_ENV
-          FIRMWARE_VER="24.10.2-$(date +%Y%m%d%H%M)"
-          echo "FIRMWARE_VERSION=$FIRMWARE_VER" >> $GITHUB_ENV
-          echo "Kernel: $KERNEL_VER, Firmware: $FIRMWARE_VER"
-
-      # ===== 15. 生成插件清单（过滤 kmod 等驱动依赖） =====
-      - name: Generate Plugin List
-        if: steps.compile.outputs.status == 'success'
-        run: |
-          cd openwrt
-          # 从 manifest 中提取用户空间插件，排除 kmod、lib、kernel 等系统包
-          grep -E '^luci-app-|^luci-theme-|^smartdns|^adguardhome|^nlbwmon|^ttyd|^mwan3|^docker|^easytier|^samba4|^upnp' \
-            bin/targets/x86/64/*.manifest 2>/dev/null | \
-            grep -vE 'kmod-|^lib|^kernel|^base-files|^busybox' | \
-            awk '{print "- " $1}' > $GITHUB_WORKSPACE/plugin-list.txt || true
-          echo "=== Plugin List ==="
-          cat $GITHUB_WORKSPACE/plugin-list.txt
-
-      # ===== 16. 上传固件到 Actions Artifacts =====
-      - name: Upload Firmware to Artifacts
-        if: steps.compile.outputs.status == 'success'
-        uses: actions/upload-artifact@v4
-        with:
-          name: iStoreOS-x86_64-${{ env.REPO_COMMIT }}
-          path: firmware/
-
-      # ===== 17. 自动创建 GitHub Release 并发布固件 =====
-      - name: Create Release and Upload Firmware
-        if: steps.compile.outputs.status == 'success' && github.event_name != 'pull_request'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: x86_64-${{ github.run_number }}
-          name: "iStoreOS X86_64 ${{ env.FIRMWARE_VERSION }}"
-          body: |
-            # iStoreOS X86_64 固件
-
-            ## 固件信息
-            - **LAN IP**: `192.168.2.1`
-            - **后台登录**: `root` / `asdfghjkL666666`
-            - **内核版本**: `${{ env.KERNEL_VERSION }}`
-            - **固件版本**: `${{ env.FIRMWARE_VERSION }}`
-            - **源码分支**: `${{ env.REPO_BRANCH }}`
-
-            ## 已安装插件
-
-            ${{ env.PLUGIN_LIST }}
-
-            ## 刷写说明
-            1. 解压 `*.img.gz` 文件
-            2. 使用写盘工具（如 balenaEtcher、DiskImage）写入 U 盘或硬盘
-            3. 从目标设备启动，通过 `http://192.168.2.1` 访问后台
-
-            ---
-            *由 GitHub Actions 自动构建*
-          files: firmware/*
-          generate_release_notes: false
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PLUGIN_LIST: ${{ env.PLUGIN_LIST }}
-
-      # ===== 18. 清理旧的工作流运行记录（可选） =====
-      - name: Cleanup Old Workflow Runs
-        if: always()
-        uses: Mattraks/delete-workflow-runs@v2
-        with:
-          token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          retain_days: 7
-          keep_minimum_runs: 3
+        
