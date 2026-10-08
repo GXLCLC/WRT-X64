@@ -1,22 +1,20 @@
 name: Build iStoreOS 24.10 for X86_64
 
-# 触发条件：手动触发、推送至 main 分支、定时编译
 on:
   workflow_dispatch:
   push:
     branches: [main]
   schedule:
-    - cron: '0 16 * * 5'  # 每周五 16:00 UTC 自动编译
+    - cron: '0 16 * * 5'
 
 env:
   REPO_URL: https://github.com/istoreos/istoreos.git
-  REPO_BRANCH: istoreos-24.10   # 明确拉取 24.10 分支源码
+  REPO_BRANCH: istoreos-24.10
   CONFIG_FILE: config/x86_64.config
   TZ: Asia/Shanghai
 
 jobs:
   build:
-    # 明确指定使用 Ubuntu 22.04，避免 latest 升级到 24.04 导致软件包缺失
     runs-on: ubuntu-22.04
 
     steps:
@@ -29,25 +27,21 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          # 释放磁盘空间，移除无用的大型文件
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
-          # 更新软件源列表
+          sudo dpkg --add-architecture i386
           sudo -E apt-get -qq update
-          # 安装编译所需依赖（已适配 Ubuntu 22.04）
-          # 注意：已移除 python2.7，用 genisoimage 替换 mkisofs
           sudo -E apt-get -qq install -y \
             ack antlr3 asciidoc autoconf automake autopoint binutils bison \
             build-essential bzip2 ccache cmake cpio curl device-tree-compiler \
             fastjar flex gawk gettext gcc-multilib g++-multilib git gperf \
-            haveged help2man intltool libc6-dev-i386 libc6-dev-mips32 \
-            libelf-dev libglib2.0-dev libgmp-dev libltdl-dev libmpc-dev \
+            haveged help2man intltool libc6-dev-i386 libelf-dev \
+            libglib2.0-dev libgmp-dev libltdl-dev libmpc-dev \
             libmpfr-dev libncurses5-dev libncursesw5-dev libreadline-dev \
             libssl-dev libtool lrzsz genisoimage msmtp nano ninja-build \
             p7zip p7zip-full patch pkgconf python3 python3-pip python3-ply \
             python3-docutils qemu-utils rsync scons squashfs-tools \
             subversion swig texinfo uglifyjs upx-ucl unzip vim wget \
             xmlto xxd zlib1g-dev
-          # 清理无用依赖，释放磁盘空间
           sudo -E apt-get -qq autoremove --purge
           sudo -E apt-get -qq clean
 
@@ -91,7 +85,6 @@ jobs:
         run: |
           cd openwrt
           make defconfig
-          # 将 Argon 设为默认主题
           sed -i 's/CONFIG_PACKAGE_luci-theme-bootstrap=y/# CONFIG_PACKAGE_luci-theme-bootstrap is not set/' .config
           sed -i 's/# CONFIG_PACKAGE_luci-theme-argon is not set/CONFIG_PACKAGE_luci-theme-argon=y/' .config
           make defconfig
@@ -108,11 +101,10 @@ jobs:
       - name: Apply System Config Customization
         run: |
           cd openwrt
-          # 将独立脚本复制到源码树中，在首次启动时自动执行
           cp $GITHUB_WORKSPACE/scripts/system-config.sh package/base-files/files/etc/uci-defaults/99-custom-config.sh
           chmod +x package/base-files/files/etc/uci-defaults/99-custom-config.sh
 
-      # ===== 11. 编译固件（多线程，失败时降级单线程输出详细日志） =====
+      # ===== 11. 编译固件 =====
       - name: Compile Firmware
         id: compile
         run: |
@@ -121,7 +113,7 @@ jobs:
           make -j$(nproc) || make -j1 V=s
           echo "status=success" >> $GITHUB_OUTPUT
 
-      # ===== 12. 执行 diy-part2 脚本（编译后处理） =====
+      # ===== 12. 执行 diy-part2 脚本 =====
       - name: Run DIY Scripts (Part 2)
         if: steps.compile.outputs.status == 'success'
         run: |
@@ -135,6 +127,15 @@ jobs:
         run: |
           cd openwrt/bin/targets/x86/64
           mkdir -p $GITHUB_WORKSPACE/firmware
-          # 仅复制 img.gz 文件，不生成 VHDX/VMDK
           cp -v *.img.gz $GITHUB_WORKSPACE/firmware/ 2>/dev/null || true
-        
+          cp -v *.manifest $GITHUB_WORKSPACE/firmware/ 2>/dev/null || true
+          cp -v *.sha256sums $GITHUB_WORKSPACE/firmware/ 2>/dev/null || true
+          echo "=== Firmware files ==="
+          ls -lh $GITHUB_WORKSPACE/firmware/
+
+      # ===== 14. 提取系统信息 =====
+      - name: Extract System Info
+        if: steps.compile.outputs.status == 'success'
+        run: |
+          cd openwrt
+          K
