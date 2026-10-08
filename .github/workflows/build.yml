@@ -1,218 +1,214 @@
-# ==============================================================
-# ImmortalWrt x86_64 固件云编译工作流（P3TERX 风格）
-# 功能：自动拉取 master 分支最新源码 → 补齐缺失第三方插件
-#       → 全自动编译 squashfs combined IMG 镜像 → 自动发布 Release
-# ==============================================================
-name: Build ImmortalWrt x86_64
+name: Build iStoreOS 24.10 for X86_64
 
+# 触发条件：手动触发、推送至 main 分支、定时编译
 on:
-  # 支持在 Actions 页面手动触发
   workflow_dispatch:
-  # 配置文件或脚本变更时自动触发（如不需要可删除此段）
   push:
-    branches:
-      - main          # 按你的仓库默认分支修改
-    paths:
-      - "config/**"
-      - "scripts/**"
-      - ".github/workflows/**"
+    branches: [main]
+  schedule:
+    - cron: '0 16 * * 5'  # 每周五 16:00 UTC 自动编译
 
 env:
-  # ImmortalWrt 源码仓库与分支（master = 最新内核与软件包）
-  REPO_URL: https://github.com/immortalwrt/immortalwrt
-  REPO_BRANCH: master
-  # 仓库内置的固件配置文件路径
-  CONFIG_FILE: config/x86-64.config
+  REPO_URL: https://github.com/istoreos/istoreos.git
+  REPO_BRANCH: istoreos-24.10   # 拉取 24.10 活跃分支
+  CONFIG_FILE: config/x86_64.config
   TZ: Asia/Shanghai
-
-# 同一时间仅保留一个构建任务，自动取消旧的重复任务，节约资源
-concurrency:
-  group: build-x86_64
-  cancel-in-progress: true
 
 jobs:
   build:
-    # 用户指定的编译环境：Ubuntu 22.04
-    runs-on: ubuntu-22.04
-    permissions:
-      # 授权工作流创建 Release（自动发布固件必需）
-      contents: write
+    runs-on: ubuntu-latest
 
     steps:
-      # ----------------------------------------------------------
-      # 步骤 1：检出本仓库，获取 .config 与三个功能脚本
-      # ----------------------------------------------------------
-      - name: 检出仓库文件
+      # ===== 1. 检出当前仓库代码 =====
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # ----------------------------------------------------------
-      # ----------------------------------------------------------
-      # 步骤 2：初始化编译环境
-      #   a. 清理 runner 预装的无用软件，释放磁盘空间（编译约需 25G+）
-      #   b. 安装 ImmortalWrt 官方要求的全量编译依赖
-      #   c. 创建 8G 交换分区，防止链接阶段内存不足导致 OOM
-      # ----------------------------------------------------------
-      - name: 初始化编译环境（清理磁盘 + 安装依赖 + 创建 swap）
+      # ===== 2. 初始化编译环境，安装依赖工具 =====
+      - name: Initialization Environment
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          # 删除与编译无关的预装组件（.NET / Android SDK / CodeQL 等）
-          sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/codeql
-          # 卸载大体积预装软件，进一步释放磁盘
-          sudo -E apt-get -y purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mongodb* moby* snapd* || true
-          # 更新软件源索引
+          sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
           sudo -E apt-get -qq update
-          # 一次性安装官方文档要求的全部编译依赖，避免编译中途缺工具
-          sudo -E apt-get -qq install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
-            ccache cmake cpio curl device-tree-compiler ecj fastjar flex gawk gettext gcc-multilib g++-multilib \
-            git gperf haveged help2man intltool lib32gcc-s1 libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev \
-            libltdl-dev libmpc-dev libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev libtool \
-            libyaml-dev libz-dev lld llvm mkisofs msmtp nano ninja-build p7zip-full patch pkgconf python3 \
-            python3-pip python3-ply python3-docutils python3-setuptools qemu-utils re2c rsync scons squashfs-tools \
-            subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
-          # 设置时区，保证后续 Release 时间戳正确
-          sudo timedatectl set-timezone "$TZ"
+          sudo -E apt-get -qq install -y ack antlr3 asciidoc autoconf automake \
+            autopoint binutils bison build-essential bzip2 ccache cmake cpio \
+            curl device-tree-compiler fastjar flex gawk gettext gcc-multilib \
+            g++-multilib git gperf haveged help2man intltool libc6-dev-i386 \
+            libc6-dev-mips32 libelf-dev libglib2.0-dev libgmp-dev libltdl-dev \
+            libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev \
+            libreadline-dev libssl-dev libtool lrzsz mkisofs msmtp nano \
+            ninja-build p7zip p7zip-full patch pkgconf python2.7 python3 \
+            python3-pip python3-ply python3-docutils python3-pkg-resources \
+            qemu-utils rsync scons squashfs-tools subversion swig texinfo \
+            uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+          sudo -E apt-get -qq autoremove --purge
+          sudo -E apt-get -qq clean
 
-          # ===== 新增：清理已存在的旧 swap，避免 "Text file busy" 报错 =====
-          # 关闭当前系统占用的 swap（不存在时会静默跳过，不报错）
-          sudo swapoff -a > /dev/null 2>&1
-          # 删除残留的旧 swap 文件，确保 fallocate 能全新分配
-          sudo rm -f /swapfile
-          # ===== 新增结束 =====
-
-          # 创建 8G swap（物理内存仅 7G，内核与大插件链接阶段易 OOM）
-          sudo fallocate -l 8G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile >/dev/null
-          sudo swapon /swapfile
-          # 打印磁盘 / 内存概况，便于排查环境问题
-          echo "===== 磁盘空间 ====="; df -hT / /mnt
-          echo "===== 内存与 swap ====="; free -h
-
-      # ----------------------------------------------------------
-      # 步骤 3：浅克隆 ImmortalWrt 源码（master 分支，最新内核）
-      # ----------------------------------------------------------
-      - name: 克隆 ImmortalWrt 源码（master 分支）
+      # ===== 3. 克隆 iStoreOS 24.10 源码 =====
+      - name: Clone iStoreOS Source
         run: |
-          # --depth 1 仅拉取最新一次提交，大幅缩短克隆时间
-          git clone --depth 1 "$REPO_URL" -b "$REPO_BRANCH" immortalwrt
-          # 记录当前源码 commit，便于固件溯源
-          git -C immortalwrt log -1 --format="本次编译源码: %H %ci"
+          git clone --depth 1 $REPO_URL -b $REPO_BRANCH openwrt
+          cd openwrt
+          echo "REPO_COMMIT=$(git rev-parse HEAD)" >> $GITHUB_ENV
+          echo "REPO_BRANCH=$REPO_BRANCH" >> $GITHUB_ENV
 
-      # ----------------------------------------------------------
-      # 步骤 4：更新并安装 feeds（ImmortalWrt 官方软件源）
-      #   update：拉取 packages / luci 等外部软件源
-      #   install：将 feeds 中的软件包链接进编译树
-      # ----------------------------------------------------------
-      - name: 更新并安装官方 feeds 软件源
+      # ===== 4. 加载自定义编译配置文件 =====
+      - name: Load Custom Config
         run: |
-          cd immortalwrt
+          cp $CONFIG_FILE openwrt/.config
+
+      # ===== 5. 执行 diy-part1 脚本（添加第三方源、克隆插件） =====
+      - name: Run DIY Scripts (Part 1)
+        run: |
+          chmod +x $GITHUB_WORKSPACE/scripts/diy-part1.sh
+          cd openwrt
+          $GITHUB_WORKSPACE/scripts/diy-part1.sh
+
+      # ===== 6. 拉取系统配置修改脚本（独立仓库） =====
+      - name: Fetch System Config Script
+        run: |
+          cd openwrt
+          curl -fsSL -o $GITHUB_WORKSPACE/scripts/system-config.sh \
+            https://raw.githubusercontent.com/YOUR_USERNAME/istoreos-config-script/main/system-config.sh
+          chmod +x $GITHUB_WORKSPACE/scripts/system-config.sh
+
+      # ===== 7. 更新并安装 feeds 软件包源 =====
+      - name: Update Feeds
+        run: |
+          cd openwrt
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      # ----------------------------------------------------------
-      # 步骤 5：拉取缺失的第三方插件
-      #   规则：优先使用 ImmortalWrt 自带软件包；
-      #         仅当源码/feeds 中不存在时，才从第三方仓库
-      #         稀疏检出（sparse checkout）所需子目录，不整仓克隆
-      # ----------------------------------------------------------
-      - name: 拉取缺失的第三方插件（SmartDNS / OpenClash / DDNSTO / EasyTier 等）
+      # ===== 8. 执行 make defconfig 生成最终配置并验证 =====
+      - name: Configure Firmware
         run: |
-          cd immortalwrt
-          bash "$GITHUB_WORKSPACE/scripts/prepare-packages.sh"
-
-      # ----------------------------------------------------------
-      # 步骤 6：应用系统配置脚本
-      #   读取 scripts/modify_system_config.sh 中定义的
-      #   LAN IP / 登录密码 / 主机名 / 默认主题，
-      #   生成首次开机自动生效的 uci-defaults 配置
-      # ----------------------------------------------------------
-      - name: 写入系统配置（LAN IP / 密码 / 主机名 / Argon 默认主题）
-        run: |
-          cd immortalwrt
-          bash "$GITHUB_WORKSPACE/scripts/modify_system_config.sh"
-
-      # ----------------------------------------------------------
-      # 步骤 7：载入 .config 并自动补全依赖
-      #   defconfig 自动解析依赖项；不存在的包会被自动剔除
-      #   （不会中断编译），日志中可看到被忽略的选项
-      # ----------------------------------------------------------
-      - name: 载入固件配置并补全依赖
-        run: |
-          cd immortalwrt
-          # 将仓库内置配置复制为源码根目录 .config
-          cp "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
-          # 自动补全依赖；缺失软件包自动剔除，保证编译不中断
+          cd openwrt
+          make defconfig
+          # 将 Argon 设为默认主题
+          sed -i 's/CONFIG_PACKAGE_luci-theme-bootstrap=y/# CONFIG_PACKAGE_luci-theme-bootstrap is not set/' .config
+          sed -i 's/# CONFIG_PACKAGE_luci-theme-argon is not set/CONFIG_PACKAGE_luci-theme-argon=y/' .config
           make defconfig
 
-      # ----------------------------------------------------------
-      # 步骤 8：恢复 dl 缓存（复用上次构建下载的源码包，加速重复编译）
-      # ----------------------------------------------------------
-      - name: 恢复 dl 源码包缓存
-        uses: actions/cache@v4
-        with:
-          path: immortalwrt/dl
-          key: immortalwrt-x86_64-dl-${{ github.run_id }}
-          restore-keys: |
-            immortalwrt-x86_64-dl-
-
-      # ----------------------------------------------------------
-      # 步骤 9：下载全部软件源码包（dl 目录）
-      # ----------------------------------------------------------
-      - name: 下载编译所需源码包
+      # ===== 9. 预下载编译所需的软件包源码 =====
+      - name: Download Package Sources
         run: |
-          cd immortalwrt
-          # 8 线程并行下载所有源码压缩包
+          cd openwrt
           make download -j8
-          # 清理下载不完整的文件（小于 1KB 视为损坏，删除避免编译报错）
+          find dl -size -1024c -exec ls -l {} \;
           find dl -size -1024c -exec rm -f {} \;
 
-      # ----------------------------------------------------------
-      # 步骤 10：编译固件（全程无交互）
-      #   多线程全速编译；若失败自动降级为单线程重跑，
-      #   并输出详细日志（V=s）便于定位报错位置
-      # ----------------------------------------------------------
-      - name: 编译固件（失败自动单线程重试）
+      # ===== 10. 执行系统配置修改脚本（独立仓库拉取） =====
+      - name: Apply System Config Customization
         run: |
-          cd immortalwrt
-          echo "使用 $(nproc) 线程开始编译，预计 2~4 小时..."
-          # 多线程编译；失败时单线程重跑并输出详细过程
+          cd openwrt
+          # 将独立脚本复制到源码树中，在编译前生效
+          cp $GITHUB_WORKSPACE/scripts/system-config.sh package/base-files/files/etc/uci-defaults/99-custom-config.sh
+          chmod +x package/base-files/files/etc/uci-defaults/99-custom-config.sh
+
+      # ===== 11. 编译固件（多线程，失败时降级单线程输出详细日志） =====
+      - name: Compile Firmware
+        id: compile
+        run: |
+          cd openwrt
+          echo -e "$(nproc) thread compile"
           make -j$(nproc) || make -j1 V=s
-          echo "===== 编译完成，产物列表 ====="
-          ls -lh bin/targets/x86/64/
+          echo "status=success" >> $GITHUB_OUTPUT
 
-      # ----------------------------------------------------------
-      # 步骤 11：生成 Release 发布信息
-      #   复制 squashfs combined 镜像 → 计算 SHA256 →
-      #   汇总固件版本 / 内核版本 / 登录信息 / 插件清单
-      # ----------------------------------------------------------
-      - name: 整理产物并生成 Release 说明
+      # ===== 12. 执行 diy-part2 脚本（编译后处理） =====
+      - name: Run DIY Scripts (Part 2)
+        if: steps.compile.outputs.status == 'success'
         run: |
-          bash "$GITHUB_WORKSPACE/scripts/generate-release-info.sh" \
-            "$GITHUB_WORKSPACE/immortalwrt" \
-            "$GITHUB_WORKSPACE/release"
+          chmod +x $GITHUB_WORKSPACE/scripts/diy-part2.sh
+          cd openwrt
+          $GITHUB_WORKSPACE/scripts/diy-part2.sh
 
-      # ----------------------------------------------------------
-      # 步骤 12：上传固件到 Artifacts（Release 之外的临时备份渠道）
-      # ----------------------------------------------------------
-      - name: 上传固件到 Artifacts（保留 7 天）
+      # ===== 13. 整理固件文件，仅保留 IMG 格式 =====
+      - name: Organize Firmware Files
+        if: steps.compile.outputs.status == 'success'
+        run: |
+          cd openwrt/bin/targets/x86/64
+          mkdir -p $GITHUB_WORKSPACE/firmware
+          # 仅复制 img.gz 文件，不生成 VHDX/VMDK
+          cp -v *.img.gz $GITHUB_WORKSPACE/firmware/ 2>/dev/null || true
+          cp -v *.manifest $GITHUB_WORKSPACE/firmware/ 2>/dev/null || true
+          cp -v *.sha256sums $GITHUB_WORKSPACE/firmware/ 2>/dev/null || true
+          echo "=== Firmware files ==="
+          ls -lh $GITHUB_WORKSPACE/firmware/
+
+      # ===== 14. 提取系统信息（内核版本、固件版本） =====
+      - name: Extract System Info
+        if: steps.compile.outputs.status == 'success'
+        run: |
+          cd openwrt
+          KERNEL_VER=$(make kernelversion 2>/dev/null || echo "unknown")
+          echo "KERNEL_VERSION=$KERNEL_VER" >> $GITHUB_ENV
+          FIRMWARE_VER="24.10.2-$(date +%Y%m%d%H%M)"
+          echo "FIRMWARE_VERSION=$FIRMWARE_VER" >> $GITHUB_ENV
+          echo "Kernel: $KERNEL_VER, Firmware: $FIRMWARE_VER"
+
+      # ===== 15. 生成插件清单（过滤 kmod 等驱动依赖） =====
+      - name: Generate Plugin List
+        if: steps.compile.outputs.status == 'success'
+        run: |
+          cd openwrt
+          # 从 manifest 中提取用户空间插件，排除 kmod、lib、kernel 等系统包
+          grep -E '^luci-app-|^luci-theme-|^smartdns|^adguardhome|^nlbwmon|^ttyd|^mwan3|^docker|^easytier|^samba4|^upnp' \
+            bin/targets/x86/64/*.manifest 2>/dev/null | \
+            grep -vE 'kmod-|^lib|^kernel|^base-files|^busybox' | \
+            awk '{print "- " $1}' > $GITHUB_WORKSPACE/plugin-list.txt || true
+          echo "=== Plugin List ==="
+          cat $GITHUB_WORKSPACE/plugin-list.txt
+
+      # ===== 16. 上传固件到 Actions Artifacts =====
+      - name: Upload Firmware to Artifacts
+        if: steps.compile.outputs.status == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-x86_64-firmware
-          path: immortalwrt/bin/targets/x86/64/*squashfs-combined*.img.gz
-          retention-days: 7
+          name: iStoreOS-x86_64-${{ env.REPO_COMMIT }}
+          path: firmware/
 
-      # ----------------------------------------------------------
-      # 步骤 13：创建 GitHub Release，自动发布固件镜像与说明
-      # ----------------------------------------------------------
-      - name: 创建 Release 发布固件
+      # ===== 17. 自动创建 GitHub Release 并发布固件 =====
+      - name: Create Release and Upload Firmware
+        if: steps.compile.outputs.status == 'success' && github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: x86_64-${{ github.run_number }}
+          name: "iStoreOS X86_64 ${{ env.FIRMWARE_VERSION }}"
+          body: |
+            # iStoreOS X86_64 固件
+
+            ## 固件信息
+            - **LAN IP**: `192.168.2.1`
+            - **后台登录**: `root` / `asdfghjkL666666`
+            - **内核版本**: `${{ env.KERNEL_VERSION }}`
+            - **固件版本**: `${{ env.FIRMWARE_VERSION }}`
+            - **源码分支**: `${{ env.REPO_BRANCH }}`
+
+            ## 已安装插件
+
+            ${{ env.PLUGIN_LIST }}
+
+            ## 刷写说明
+            1. 解压 `*.img.gz` 文件
+            2. 使用写盘工具（如 balenaEtcher、DiskImage）写入 U 盘或硬盘
+            3. 从目标设备启动，通过 `http://192.168.2.1` 访问后台
+
+            ---
+            *由 GitHub Actions 自动构建*
+          files: firmware/*
+          generate_release_notes: false
+          draft: false
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # 标签名附加时间戳，避免多次构建 tag 冲突
-          TAG="X86_64-$(date +%Y%m%d-%H%M)"
-          gh release create "$TAG" \
-            "$GITHUB_WORKSPACE"/release/*.img.gz \
-            "$GITHUB_WORKSPACE"/release/sha256sums \
-            --title "ImmortalWrt-x86_64-${TAG}" \
-            --notes-file "$GITHUB_WORKSPACE/release/release_notes.md"
+          PLUGIN_LIST: ${{ env.PLUGIN_LIST }}
+
+      # ===== 18. 清理旧的工作流运行记录（可选） =====
+      - name: Cleanup Old Workflow Runs
+        if: always()
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 7
+          keep_minimum_runs: 3
