@@ -138,4 +138,74 @@ jobs:
         if: steps.compile.outputs.status == 'success'
         run: |
           cd openwrt
-          K
+          KERNEL_VER=$(make kernelversion 2>/dev/null || echo "unknown")
+          echo "KERNEL_VERSION=$KERNEL_VER" >> $GITHUB_ENV
+          FIRMWARE_VER="24.10.2-$(date +%Y%m%d%H%M)"
+          echo "FIRMWARE_VERSION=$FIRMWARE_VER" >> $GITHUB_ENV
+          echo "Kernel: $KERNEL_VER, Firmware: $FIRMWARE_VER"
+
+      # ===== 15. 生成插件清单 =====
+      - name: Generate Plugin List
+        if: steps.compile.outputs.status == 'success'
+        run: |
+          cd openwrt
+          grep -E '^luci-app-|^luci-theme-|^smartdns|^adguardhome|^nlbwmon|^ttyd|^mwan3|^docker|^easytier|^samba4|^upnp' \
+            bin/targets/x86/64/*.manifest 2>/dev/null | \
+            grep -vE 'kmod-|^lib|^kernel|^base-files|^busybox' | \
+            awk '{print "- " $1}' > $GITHUB_WORKSPACE/plugin-list.txt || true
+          echo "=== Plugin List ==="
+          cat $GITHUB_WORKSPACE/plugin-list.txt
+
+      # ===== 16. 上传固件到 Actions Artifacts =====
+      - name: Upload Firmware to Artifacts
+        if: steps.compile.outputs.status == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: iStoreOS-x86_64-${{ env.REPO_COMMIT }}
+          path: firmware/
+
+      # ===== 17. 自动创建 GitHub Release =====
+      - name: Create Release and Upload Firmware
+        if: steps.compile.outputs.status == 'success' && github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: x86_64-${{ github.run_number }}
+          name: "iStoreOS X86_64 ${{ env.FIRMWARE_VERSION }}"
+          body: |
+            # iStoreOS X86_64 固件
+
+            ## 固件信息
+            - **LAN IP**: `192.168.2.1`
+            - **后台登录**: `root` / `asdfghjkL666666`
+            - **内核版本**: `${{ env.KERNEL_VERSION }}`
+            - **固件版本**: `${{ env.FIRMWARE_VERSION }}`
+            - **源码分支**: `${{ env.REPO_BRANCH }}`
+
+            ## 已安装插件
+
+            ${{ env.PLUGIN_LIST }}
+
+            ## 刷写说明
+            1. 解压 `*.img.gz` 文件
+            2. 使用写盘工具写入 U 盘或硬盘
+            3. 从目标设备启动，通过 `http://192.168.2.1` 访问后台
+
+            ---
+            *由 GitHub Actions 自动构建*
+          files: firmware/*
+          generate_release_notes: false
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PLUGIN_LIST: ${{ env.PLUGIN_LIST }}
+
+      # ===== 18. 清理旧的工作流运行记录 =====
+      - name: Cleanup Old Workflow Runs
+        if: always()
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 7
+          keep_minimum_runs: 3
