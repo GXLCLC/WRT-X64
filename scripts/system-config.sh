@@ -28,7 +28,7 @@ echo "[system-config] LAN IP 已设置为 ${LAN_IP}"
 # 2. 设置 root 登录密码（openssl 动态生成 SHA-512 哈希写入 shadow）
 # ---------------------------------------------------------------------------
 PASSWORD_HASH="$(openssl passwd -6 "${ROOT_PASSWORD}")"
-sed -i "s|^root:[^:]*:|root:${PASSWORD_HASH}:|" package/base-files/files/etc/shadow
+sed -i 's|^root:[^:]*:|root:'"${PASSWORD_HASH}"':|' package/base-files/files/etc/shadow
 echo "[system-config] root 登录密码已更新"
 
 # ---------------------------------------------------------------------------
