@@ -4,7 +4,6 @@
 # 触发方式：手动触发（workflow_dispatch）
 # ============================================================================
 name: ImmortalWrt X86_64 云编译
-
 on:
   workflow_dispatch:                      # 仅支持手动触发
     inputs:
@@ -12,23 +11,19 @@ on:
         description: "ImmortalWrt 源码分支"
         required: false
         default: "openwrt-24.10"
-
 # 环境变量集中定义，便于统一维护
 env:
   REPO_URL: https://github.com/immortalwrt/immortalwrt          # ImmortalWrt 官方源码仓库
   REPO_BRANCH: ${{ github.event.inputs.repo_branch || 'openwrt-24.10' }}  # 编译分支
   CONFIG_FILE: "config/x86_64.config"                                  # 仓库内置固件配置文件
   TZ: Asia/Shanghai                                             # 编译环境时区（需求要求）
-
 # 创建 Release 需要仓库内容写权限
 permissions:
   contents: write
-
 # 同一时间仅允许一个构建任务运行，新的构建会取消旧任务，避免资源浪费
 concurrency:
   group: immortalwrt-x86_64-build
   cancel-in-progress: true
-
 jobs:
   build:
     # 需求要求：基于 Ubuntu 22.04 编译环境
@@ -37,7 +32,6 @@ jobs:
       # 步骤 1：检出自建仓库，获取工作流引用的配置文件与全部独立脚本
       - name: 1. 检出仓库文件
         uses: actions/checkout@main
-
       # 步骤 2：初始化编译环境——设置上海时区并清理无关组件释放磁盘空间
       - name: 2. 初始化编译环境（时区 / 磁盘清理）
         run: |
@@ -47,7 +41,6 @@ jobs:
           sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/codeql
           sudo -E apt-get -qq update
           sudo -E apt-get -qq purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mongodb* moby* || true
-
       # 步骤 3：安装 OpenWrt 官方要求的全部编译依赖包（Ubuntu 22.04 环境）
       - name: 3. 安装编译依赖
         env:
@@ -64,33 +57,28 @@ jobs:
           sudo -E apt-get -qq clean
           # 确认时区设置已生效
           timedatectl | grep "Time zone"
-
       # 步骤 4：浅克隆 ImmortalWrt 源码（仅拉取最新提交，节省时间与磁盘）
       - name: 4. 克隆 ImmortalWrt 源码
         run: |
           df -hT
           git clone --depth 1 "$REPO_URL" -b "$REPO_BRANCH" openwrt
-
       # 步骤 5：更新 feeds，拉取 ImmortalWrt 官方软件源索引
       - name: 5. 更新 feeds 官方软件源
         run: |
           cd openwrt
           ./scripts/feeds update -a
-
       # 步骤 6：执行第三方插件拉取脚本（优先源码自带；缺失时才浅克隆第三方仓库目标目录）
       - name: 6. 拉取第三方插件（按需浅克隆）
         run: |
           chmod +x scripts/*.sh
           cd openwrt
           ../scripts/third-party-packages.sh
-
       # 步骤 7：安装 feeds 软件包，将官方源中的软件链接进编译树
       - name: 7. 安装 feeds
         run: |
           cd openwrt
           ./scripts/feeds install -a
           ./scripts/feeds install -a     # 二次执行，确保新增包及其依赖链接完整
-
       # 步骤 8：载入 X86_64.config，并自动为所有 LuCI 插件同步勾选 zh-cn 中文语言包
       - name: 8. 载入固件配置（X86_64.config）
         run: |
@@ -112,8 +100,7 @@ jobs:
           make defconfig
           echo ">>> 最终启用的中文语言包："
           grep -E '^CONFIG_PACKAGE_luci-i18n-.*(zh-cn|zh-Hans)=y' .config || true
-
-      # 步骤 9：缓存 dl 依赖下载目录，加速重复编译（可选步骤，可按需删除）
+      # 步骤 9：缓存 dl 依赖包目录
       - name: 9. 缓存 dl 依赖包目录
         uses: actions/cache@main
         with:
@@ -121,15 +108,12 @@ jobs:
           key: immortalwrt-dl-${{ env.REPO_BRANCH }}-${{ github.run_id }}
           restore-keys: |
             immortalwrt-dl-${{ env.REPO_BRANCH }}-
-
-      # 步骤 10：执行系统配置定制脚本（LAN IP / root 密码 / 主机名 / 时区 / 默认主题）
-      #          独立脚本独立维护，后续修改这些信息无需改动本工作流
+      # 步骤 10：应用系统配置定制脚本（LAN IP / root 密码 / 主机名 / 时区 / 默认主题）
       - name: 10. 应用系统配置定制脚本
         run: |
           cd openwrt
           ../scripts/system-config.sh
-
-      # 步骤 11：下载全部软件包源码（dl 目录），并清理下载不完整的文件
+      # 步骤 11：下载 dl 软件包源码，并清理下载不完整的文件
       - name: 11. 下载 dl 软件包
         run: |
           cd openwrt
@@ -137,18 +121,26 @@ jobs:
           # 体积小于 1KB 的文件视为下载失败，删除避免后续编译中断
           find dl -size -1024c -exec ls -l {} \;
           find dl -size -1024c -exec rm -f {} \;
-
+      # ==========【新增关键步骤】强制PATH优先使用ImmortalWrt内置Go工具链 + 版本校验 ==========
+      - name: 11.5 前置设置PATH，锁定使用源码内置Go
+        run: |
+          cd openwrt
+          export PATH="$PWD/staging_dir/host/bin:$PATH"
+          echo "PATH=$PATH"
+          echo ">>> 当前调用go版本："
+          go version
+          echo ">>> go所在路径："
+          which go
       # 步骤 12：多线程编译固件；若失败自动降级为单线程详细输出重试，便于定位错误
       - name: 12. 编译固件
         run: |
           cd openwrt
+          export PATH="$PWD/staging_dir/host/bin:$PATH"
           echo ">>> 使用 $(nproc) 线程并行编译，预计耗时 2~4 小时"
           make -j$(nproc) || make -j1 V=s
-
       # 步骤 13：查看磁盘空间，确认编译产物生成正常
       - name: 13. 查看磁盘空间
         run: df -hT
-
       # 步骤 14：整理固件输出，确保仅保留 squashfs 的 IMG 镜像文件
       - name: 14. 整理固件输出（仅保留 IMG 镜像）
         run: |
@@ -157,21 +149,18 @@ jobs:
           rm -f ./*.vmdk ./*.vhdx ./*.vdi ./*.vhd ./*.qcow2 2>/dev/null || true
           echo ">>> 最终固件输出清单："
           ls -lh
-
       # 步骤 15：执行固件信息脚本，生成 Release 页面内容（版本/内核/IP/密码/插件清单）
       - name: 15. 生成固件发布信息
         run: |
           ./scripts/firmware-info.sh
           echo ">>> Release 页面内容预览："
           cat release_info.md
-
       # 步骤 16：上传固件到 Artifact，作为编译产物的在线备份（也可直接下载）
       - name: 16. 上传固件
         uses: actions/upload-artifact@main
         with:
           name: ImmortalWrt-X86_64-firmware
           path: openwrt/bin/targets/x86/64/*.img*
-
       # 步骤 17：编译失败时上传错误日志（logs 目录 + 实际 .config），用于排查 bug
       - name: 17. 上传编译失败日志
         if: failure()                    # 仅在前面任一步骤失败时执行
@@ -182,13 +171,11 @@ jobs:
             openwrt/logs
             openwrt/.config
           if-no-files-found: ignore
-
       # 步骤 18：按编译时间生成 Release 标签名称
       - name: 18. 生成 Release 标签
         id: tag
         run: |
-          echo "release_tag=ImmortalWrt-$(TZ=Asia/Shanghai date +%Y%m%d-%H%M)" >> "$GITHUB_OUTPUT"
-
+          echo "release_tag=ImmortalWrt-$(TZ=Asia/Shanghai date +%M%m%d-%H%M)" >> "$GITHUB_OUTPUT"
       # 步骤 19：编译成功后自动创建 GitHub Releases 发布固件镜像
       - name: 19. 发布固件到 Releases
         uses: softprops/action-gh-release@v2
