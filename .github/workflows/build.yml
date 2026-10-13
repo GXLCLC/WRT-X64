@@ -17,7 +17,7 @@ on:
 env:
   REPO_URL: https://github.com/immortalwrt/immortalwrt          # ImmortalWrt 官方源码仓库
   REPO_BRANCH: ${{ github.event.inputs.repo_branch || 'openwrt-24.10' }}  # 编译分支
-  CONFIG_FILE: "X86_64.config"                                  # 仓库内置固件配置文件
+  CONFIG_FILE: "config/x86_64.config"                                  # 仓库内置固件配置文件
   TZ: Asia/Shanghai                                             # 编译环境时区（需求要求）
 
 # 创建 Release 需要仓库内容写权限
