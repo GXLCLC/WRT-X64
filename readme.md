@@ -1,25 +1,27 @@
-# ImmortalWrt 24.10 X86_64 云编译仓库（修正版）
+# ImmortalWrt X86_64 自动云编译仓库
 
-## 本版修正
-1. **修复 DDNSTO / OAF 缺失**：拉取脚本改为严格模式（浅克隆 + find 自动探测
-   + Makefile 校验，失败即终止）；工作流新增 defconfig 后「关键包强校验」，
-   任何关键包未生效都会让 Actions 直接失败并高亮报错，绝不再产出残缺固件。
-2. **默认无密码**：root 空密码，首次登录 LuCI 后再设置。
-3. LuCI 24 中 opkg 更名 package-manager，config 已双写兼容。
+基于 GitHub Actions 的 ImmortalWrt 24.10（`openwrt-24.10` 分支）X86_64 定制固件云编译方案，
+全自动编译 squashfs-combined 格式 IMG 镜像并自动发布 Release。
 
 ## 使用方法
-Fork 本仓库 → Actions 页面手动触发 → 编译完成后在 Releases 下载镜像
+1. Fork 本仓库到自己的 GitHub 账号；
+2. 进入仓库 **Actions** 页面启用工作流，选择 *Build ImmortalWrt X86_64* → **Run workflow**；
+3. 等待约 2~4 小时编译完成，前往 **Releases** 页面下载固件（或从 Artifacts 下载）。
+
+## 常用自定义
+| 需求 | 修改位置 |
+| ---- | ---- |
+| 增减编译插件 | `.config` |
+| 修改 LAN IP / 登录密码 / 主机名 / 时区 / 默认主题 | `scripts/system-config.sh` |
+| Release 页面展示的账号信息 | `scripts/release-info.sh` |
+| 第三方插件拉取 | `scripts/diy-part2.sh` |
 
 ## 默认信息
-- LAN IP：192.168.2.1　账号：root　**密码：无（首次登录后请立即设置）**
+- 管理地址：http://192.168.2.1（账号 `root`，密码 `asdfghjkL666666`）
+- 集成：Argon 主题、SmartDNS、AdGuardHome、DDNSTO、OAF 应用过滤、Turbo ACC、
+  Mwan3、nlbwmon、EasyTier、OpenClash（唯一代理插件），全部带中文界面
+- 内核驱动：USB / USB 网卡 / Intel i211 / RTL8111 等常见有线网卡
 
-## 自定义入口（互不影响，独立维护）
-| 需求 | 修改文件 |
-| --- | --- |
-| 增减插件 / kmod | config/x86_64.config（同时更新 yml 中 REQUIRED_PKGS）|
-| LAN IP / 密码 / 主机名 / 主题 | scripts/system-config.sh |
-| 第三方源与拉取规则 | scripts/pull-packages.sh |
-
-## 如何确认 DDNSTO / OAF 真的编进去了
-1. Actions 日志「9. 关键包强校验」步骤：逐包显示 ✔
-2. Actions 日志「16. 整理固件产物」步骤：ipk 清单中可见 ddnsto / kmod-oaf
+## 排错
+编译失败时，在 Actions 该次运行的 Artifacts 中下载 `openwrt_build_failed_log`（build.log），
+日志包含单线程详细模式的完整错误输出，按报错定位即可。
