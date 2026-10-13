@@ -88,9 +88,9 @@ echo "==================================================="
 # 需求说明：不使用 ImmortalWrt 自带的 AdGuardHome；
 #           kenzok8 版 LuCI 面板可显示 AdGuardHome Web UI 端口；
 #           核心与面板必须同时拉取，避免“只拉面板”导致功能不完整
-remove_native "AdGuardHome"
+remove_native "adguardhome"
 remove_native "luci-app-adguardhome"
-fetch_pkg "$KENSOK8_REPO" "" "AdGuardHome"
+fetch_pkg "$KENSOK8_REPO" "" "adguardhome"
 fetch_pkg "$KENSOK8_REPO" "" "luci-app-adguardhome"
 
 # ---------- DDNSTO（源码自带则直接使用，否则拉取 linkease 前端 + 后端） ----------
