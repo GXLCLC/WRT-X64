@@ -1,53 +1,64 @@
 #!/bin/bash
-#
-# system-config.sh —— 独立系统配置脚本
-# 修改 LAN IP / 密码 / 主机名 / 时区 / 默认主题，只需维护本文件，不动工作流
-#
-# 【注意】不要修改 files/etc/config/network——编译期不存在该文件，
-#         它是设备首次启动后由 uci 生成的；必须改 config_generate 模板
-#
-
+# ============================================================================
+# 系统配置定制脚本（独立维护）
+# ----------------------------------------------------------------------------
+# 用途：集中修改固件的默认系统信息。工作流仅负责调用本脚本，
+#       后续如需调整 LAN IP、后台登录密码、主机名、时区、默认主题等，
+#       只需修改本脚本后重新触发编译，无需改动 GitHub Actions 工作流。
+# 执行方式：在 openwrt 源码根目录下执行（由工作流自动调用）
+# ============================================================================
 set -e
 
-# ============================ 可自定义配置区 ============================
-LAN_IP="192.168.2.1"
-ROOT_PASSWORD="asdfghjkL666666"
-HOSTNAME="ImmortalWrt"
-TIMEZONE_NAME="Asia/Shanghai"
-TIMEZONE_POSIX="CST-8"
-DEFAULT_THEME="argon"
-# =======================================================================
+# =====================【可自行修改的配置区】=====================
+LAN_IP="192.168.2.1"            # 固件默认 LAN IP（即管理地址）
+LAN_NETMASK="255.255.255.0"     # LAN 子网掩码
+ROOT_USER="root"                # 后台登录用户名
+ROOT_PASSWORD="12345678"        # 后台登录密码（需求默认值）
+HOSTNAME="ImmortalWrt-X86"      # 系统主机名
+TIMEZONE="CST-8"                # 系统时区（POSIX 格式）
+TIMEZONE_NAME="Asia/Shanghai"   # 系统时区名称
+DEFAULT_THEME="argon"           # LuCI 默认主题（配合 luci-theme-argon 使用）
+# ================================================================
 
-# 1. LAN 口默认 IP（config_generate 为首次启动生成网络配置的模板）
-#    分隔符用 #，即使以后改成带 CIDR 的写法（192.168.2.1/24）也不会冲突
-sed -i "s#192\.168\.1\.1#${LAN_IP}#g" package/base-files/files/bin/config_generate
-echo "[system-config] LAN IP 已设置为 ${LAN_IP}"
+# 固件首次开机自动执行的 uci-defaults 脚本路径（执行成功后系统自动删除）
+UCIDEFAULTS_FILE="package/base-files/files/etc/uci-defaults/99-custom-system-config"
 
-# 2. root 登录密码：SHA-512 哈希字符集含 "/"，因此分隔符必须用 | 而非 /
-PASSWORD_HASH="$(openssl passwd -6 "${ROOT_PASSWORD}")"
-sed -i "s|^root:[^:]*:|root:${PASSWORD_HASH}:|" package/base-files/files/etc/shadow
-echo "[system-config] root 登录密码已更新"
+echo ">>> [系统配置] 开始写入自定义系统配置..."
+echo ">>> [系统配置] LAN IP=${LAN_IP} | 用户名=${ROOT_USER} | 密码=${ROOT_PASSWORD} | 主机名=${HOSTNAME}"
 
-# 3. 主机名
-sed -i "s#hostname='ImmortalWrt'#hostname='${HOSTNAME}'#g" package/base-files/files/bin/config_generate
-sed -i "s#hostname='OpenWrt'#hostname='${HOSTNAME}'#g" package/base-files/files/bin/config_generate
-
-# 4. 时区
-sed -i "s#zonename='[^']*'#zonename='${TIMEZONE_NAME}'#g" package/base-files/files/bin/config_generate
-sed -i "s#timezone='[^']*'#timezone='${TIMEZONE_POSIX}'#g" package/base-files/files/bin/config_generate
-
-# 5. 默认主题 Argon（编译期依赖替换 + 运行期 uci-defaults 双保险）
-LUCI_MAKEFILE="feeds/luci/collections/luci/Makefile"
-if [ -f "$LUCI_MAKEFILE" ]; then
-    sed -i 's/luci-theme-bootstrap/luci-theme-argon/g' "$LUCI_MAKEFILE"
+# ---------- 1. 编译期固化默认 LAN IP（修改 network 配置生成器） ----------
+CONFIG_GENERATE="package/base-files/files/bin/config_generate"
+if [ -f "$CONFIG_GENERATE" ]; then
+    # 将 config_generate 中默认的 192.168.1.1 全部替换为自定义 LAN IP
+    sed -i "s/192\.168\.1\.1/${LAN_IP}/g" "$CONFIG_GENERATE"
+    echo ">>> [系统配置] 默认 LAN IP 已在编译期固化为: ${LAN_IP}"
 fi
-mkdir -p files/etc/uci-defaults
-cat > files/etc/uci-defaults/99-custom-default-theme <<EOF
-# 首次启动时将 LuCI 默认主题设置为 Argon
-uci -q set luci.main.mediaurlbase='/luci-static/${DEFAULT_THEME}/'
-uci -q commit luci
+
+# ---------- 2. 生成首次开机 uci-defaults 脚本（IP/密码/主机名/时区/默认主题） ----------
+mkdir -p "$(dirname "$UCIDEFAULTS_FILE")"
+cat > "$UCIDEFAULTS_FILE" <<EOF
+#!/bin/sh
+# 由 scripts/system-config.sh 自动生成的系统定制脚本（首次开机执行，成功后自动删除）
+
+# 设置 LAN 口 IP、主机名、时区、LuCI 默认主题
+uci -q batch <<UCI_EOF
+set network.lan.ipaddr='${LAN_IP}'
+set network.lan.netmask='${LAN_NETMASK}'
+commit network
+set system.@system[0].hostname='${HOSTNAME}'
+set system.@system[0].timezone='${TIMEZONE}'
+set system.@system[0].zonename='${TIMEZONE_NAME}'
+commit system
+set luci.main.mediaurlbase='/luci-static/${DEFAULT_THEME}'
+commit luci
+UCI_EOF
+
+# 设置 root 后台登录密码
+echo '${ROOT_USER}:${ROOT_PASSWORD}' | chpasswd
+
 exit 0
 EOF
-chmod +x files/etc/uci-defaults/99-custom-default-theme
+chmod +x "$UCIDEFAULTS_FILE"
 
-echo "[system-config] 全部系统配置应用完成"
+echo ">>> [系统配置] uci-defaults 定制脚本已生成: ${UCIDEFAULTS_FILE}"
+echo ">>> [系统配置] 系统配置写入完成。"
