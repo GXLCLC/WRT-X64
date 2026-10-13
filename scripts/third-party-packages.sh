@@ -119,10 +119,10 @@ else
 fi
 
 # ---------- Argon 主题配置工具 ----------
-if has_native "luci-theme-argon-config"; then
+if has_native "luci-app-argon-config"; then
     echo ">>> [第三方] Argon 主题配置工具 使用源码自带版本"
 else
-    fetch_pkg "$KENSOK8_REPO" "" "luci-theme-argon-config"
+    fetch_pkg "$KENSOK8_REPO" "" "luci-app-argon-config"
 fi
 
 # ---------- Argon 主题本体（源码自带则跳过） ----------
