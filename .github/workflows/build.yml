@@ -56,7 +56,13 @@ jobs:
             upx-ucl unzip vim wget xmlto xxhash zlib1g-dev
           # 设置编译服务器时区为 Asia/Shanghai
           sudo timedatectl set-timezone "$TZ"
-
+      # 2.5 脚本预检：四个 shell 脚本先做静态语法检查，提前暴露低级错误
+      - name: 2.5 脚本语法预检
+        run: |
+          for f in "$GITHUB_WORKSPACE/$DIY_P1_SH" "$GITHUB_WORKSPACE/$DIY_P2_SH" \
+                   "$GITHUB_WORKSPACE/$SYSTEM_CONFIG_SH" "$GITHUB_WORKSPACE/$RELEASE_INFO_SH"; do
+            bash -n "$f" && echo "语法 OK: $f"
+          done
       # 3. 浅克隆 ImmortalWrt 源码（openwrt-24.10 分支，--depth 1 节省时间）
       - name: 3. 克隆 ImmortalWrt 源码
         run: |
