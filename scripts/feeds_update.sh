@@ -76,6 +76,17 @@ log "安装官方 feeds（./scripts/feeds install -a）"
 ./scripts/feeds install -a
 
 # ---------------------------------------------------------------------------
+# 清理与第三方插件重名的官方 feed 包，避免 "recursive dependency detected!"
+# （同名包在 package/ 与 package/feeds/ 中重复定义会导致 kconfig 递归依赖错误）
+# ---------------------------------------------------------------------------
+for conflict in package/feeds/packages/adguardhome package/feeds/luci/luci-app-appfilter; do
+    if [ -e "${conflict}" ]; then
+        warn "移除与第三方插件重名的官方 feed 包：${conflict}"
+        rm -rf "${conflict}"
+    fi
+done
+
+# ---------------------------------------------------------------------------
 # 2. SmartDNS —— 优先使用 ImmortalWrt 自带包
 #    luci-app-smartdns 已存在于 ImmortalWrt luci 源，无需从第三方拉取。
 # ---------------------------------------------------------------------------
@@ -104,10 +115,19 @@ clone_sparse_dir "${DDNSTO_LUCI_URL}" "main"   "luci/luci-app-ddnsto" "luci-app-
 clone_sparse_dir "${DDNSTO_PKG_URL}"  "master" "network/services/ddnsto" "ddnsto"
 
 # ---------------------------------------------------------------------------
-# 5. OAF 应用过滤 —— 含 kmod-oaf 与 luci-app-oaf，来自独立仓库
+# 5. OAF 应用过滤 —— luci-app-oaf 来自独立仓库 destan19/OpenAppFilter
+#    说明：kmod-oaf 与 appfilter 由 ImmortalWrt 自带的 open-app-filter 包提供
+#    （该包同样是从 destan19/OpenAppFilter 拉取源码编译，且与 24.10 内核 6.6 匹配）；
+#    切勿再克隆 destan19 的 oaf/ 目录，否则 kmod-oaf 重复定义会触发
+#    "recursive dependency detected! symbol PACKAGE_kmod-oaf is selected by
+#     PACKAGE_kmod-oaf" 编译错误。
 # ---------------------------------------------------------------------------
-log "OAF：拉取 kmod-oaf + luci-app-oaf（destan19/OpenAppFilter master 分支）。"
-clone_sparse_dir "${OAF_URL}" "master" "oaf" "oaf"
+log "OAF：拉取 luci-app-oaf（destan19/OpenAppFilter master 分支），kmod-oaf 由自带 open-app-filter 提供。"
+if [ -e "package/feeds/packages/open-app-filter" ]; then
+    log "已确认官方 open-app-filter（kmod-oaf + appfilter）存在。"
+else
+    die "缺少 open-app-filter（kmod-oaf/appfilter 提供者），luci-app-oaf 依赖将无法满足。请检查官方 feeds 是否完整。"
+fi
 clone_sparse_dir "${OAF_URL}" "master" "luci-app-oaf" "luci-app-oaf"
 
 # ---------------------------------------------------------------------------
