@@ -74,8 +74,8 @@ jobs:
           cd openwrt
           ../scripts/third-party-packages.sh
       # ==========【新增步骤6.5 AdGuardHome补丁脚本】==========
-       - name: 6.5 AdGuardHome go.mod语法补丁
-         run: |
+      - name: 6.5 AdGuardHome go.mod语法补丁
+        run: |
            cd openwrt
            chmod +x ../scripts/patch_adguardhome.sh
            ../scripts/patch_adguardhome.sh
