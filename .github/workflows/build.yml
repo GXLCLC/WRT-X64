@@ -76,9 +76,9 @@ jobs:
       # ==========【新增步骤6.5 AdGuardHome补丁脚本】==========
       - name: 6.5 AdGuardHome go.mod语法补丁
         run: |
-           cd openwrt
-           chmod +x ../scripts/patch_adguardhome.sh
-           ../scripts/patch_adguardhome.sh
+          cd openwrt
+          chmod +x ../scripts/patch_adguardhome.sh
+          ../scripts/patch_adguardhome.sh
       # =======================================================
       # 步骤 7：安装 feeds 软件包，将官方源中的软件链接进编译树
       - name: 7. 安装 feeds
