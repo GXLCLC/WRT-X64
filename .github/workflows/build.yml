@@ -18,7 +18,8 @@
 # 【严格原则：绝不产出「看起来成功、实际缺件」的固件】
 #   1. feeds / 第三方拉取失败            → 立即终止
 #   2. 插件编译兼容补丁打不上            → 立即终止
-#   3. make defconfig 后关键开关被静默丢弃 → 立即终止
+#   3. make defconfig 报 kconfig 错误（如递归依赖）、或关键开关与声明的
+#      软件包被静默丢弃 → 立即终止（几分钟内就终止，不浪费整次编译）
 #   4. 任何软件包编译失败（未加 -i / IGNORE_ERRORS）→ 立即终止
 #   5. 编译产物与配置对不上（少插件/少镜像）→ 立即终止
 #   任一条不满足，都不会走到发布环节；失败时自动打包上传完整日志，
@@ -361,11 +362,34 @@ jobs:
         run: |
           set -euo pipefail
           cd "$SRC_DIR"
-          make defconfig 2>&1 | tee -a "$BUILD_LOGFILE"
+
+          # defconfig 的原始输出必须单独留一份：
+          # kconfig 报错时是「打印完错误后照常写出 .config」，退出码仍为 0，
+          # 只看 .config 完全看不出问题，唯一线索就在这份 stderr 里。
+          mkdir -p "$GITHUB_WORKSPACE/diag"
+          DEFCONFIG_OUT="$GITHUB_WORKSPACE/diag/defconfig.out"
+
+          set +e
+          make defconfig > "$DEFCONFIG_OUT" 2>&1
+          rc=$?
+          set -e
+
+          tee -a "$BUILD_LOGFILE" < "$DEFCONFIG_OUT"
+
+          # 这里只负责把 make 的真实退出码原样抛出；
+          # 「退出 0 但配置全废」的内容层面判定放在下一步统一做。
+          if [ "$rc" -ne 0 ]; then
+            echo "make defconfig 失败，退出码 $rc"
+            exit "$rc"
+          fi
 
       # ============================================================
-      # 【13】复核关键构建开关（防止被静默丢弃）
-      #   这是本工作流最关键的一道保险：
+      # 【13】复核构建配置（防止被静默丢弃）
+      #   这是本工作流最关键的一道保险，分两关：
+      #   第 0 关 · kconfig 解析错误：先看 defconfig 的原始 stderr。
+      #     递归依赖之类的 kconfig 错误会让 defconfig「退出 0 但把
+      #     所有包选择重置为默认值」，必须在几分钟内查出并终止。
+      #   第 1 关 · 关键构建开关：
       #   `make defconfig` 对「写进 .config 但不存在（或依赖不满足）的
       #   配置项」是静默丢弃的 —— 不报错、不警告。软件包层面由
       #   verify-packages.sh 兜底；但 TARGET_x86_64、GRUB_EFI_IMAGES、
@@ -373,10 +397,86 @@ jobs:
       #   必须在这里单独查，否则会编出「架构不对 / 只有 BIOS 镜像 /
       #   overlay 只有几百兆 / 界面全是英文」的固件却一路绿到底。
       # ============================================================
-      - name: 【13】复核关键构建开关未被静默丢弃
+      - name: 【13】复核构建配置（kconfig 错误 + 关键开关）
         run: |
           set -euo pipefail
           cd "$SRC_DIR"
+
+          ############################################################
+          # 第 0 关（最先执行）：kconfig 解析错误 —— 最快、最致命
+          #   `make defconfig` 遇到 kconfig 错误时的行为是：
+          #     退出码 0 + 照常写出 .config，但把依赖图整体判为不可信，
+          #     于是几乎全部 CONFIG_PACKAGE_* 被重置为默认值（=n）。
+          #   结果就是：用户清单里的 11 个插件一个都不剩，却依然能
+          #   编译 2 小时并「成功」产出固件 —— 这正是 run #71 的情况。
+          #   典型错误：
+          #     tmp/.config-package.in:NN:error: recursive dependency detected!
+          #     symbol PACKAGE_xxx is selected by PACKAGE_xxx
+          #   一个包 select 自己，只可能来自「同一个包名在源码树里被
+          #   定义了两份」。这里立刻终止并把证据全打出来，绝不带病编译，
+          #   更不会让用户白等 2 小时。
+          ############################################################
+          DEFCONFIG_OUT="$GITHUB_WORKSPACE/diag/defconfig.out"
+          if [ -f "$DEFCONFIG_OUT" ] && \
+             grep -qE 'recursive dependency detected|[^[:space:]]+:[0-9]+:error:' "$DEFCONFIG_OUT"; then
+            echo "==================================================================="
+            echo "  kconfig 解析错误：defconfig 已把全部包选择重置为默认值"
+            echo "  继续编译只会得到一个「没有任何插件」的固件，故立即终止。"
+            echo "==================================================================="
+            echo ""
+            echo "==> kconfig 原始报错"
+            grep -nE 'error:|symbol ' "$DEFCONFIG_OUT" | head -40
+
+            mapfile -t bad_syms < <(grep -oE 'symbol PACKAGE_[A-Za-z0-9_.+-]+' "$DEFCONFIG_OUT" \
+              | awk '{print $2}' | sort -u)
+
+            if [ "${#bad_syms[@]}" -gt 0 ]; then
+              echo ""
+              echo "==> 涉及 ${#bad_syms[@]} 个包符号：${bad_syms[*]}"
+              for sym in "${bad_syms[@]}"; do
+                pkg="${sym#PACKAGE_}"
+                echo ""
+                echo "==================================================================="
+                echo "  诊断包: $pkg"
+                echo "==================================================================="
+
+                echo "  [1] tmp/.packageinfo 中该包的全部分块（Depends 行即根因）"
+                awk -v key="Package: $pkg" '
+                  $0 == key          { show = 1 }
+                  show               { print "      " $0 }
+                  show && $0 == "@@" { show = 0 }
+                ' tmp/.packageinfo | head -60
+
+                echo "  [2] tmp/.config-package.in 中所有 config ${sym} 块"
+                while read -r ln; do
+                  [ -n "$ln" ] || continue
+                  end=$(awk -v s="$ln" 'NR > s && /^config / { print NR; exit }' tmp/.config-package.in)
+                  [ -n "$end" ] || end=$((ln + 30))
+                  echo "      ---- 第 ${ln}..$((end - 1)) 行 ----"
+                  sed -n "${ln},$((end - 1))p" tmp/.config-package.in | sed 's/^/      /'
+                done < <(grep -n "^config ${sym}\$" tmp/.config-package.in | cut -d: -f1)
+
+                echo "  [3] 源码树中「声明同一个包名」的位置（出现 >1 份即为冲突源）"
+                grep -rlE "^PKG_NAME[[:space:]]*:=[[:space:]]*${pkg}[[:space:]]*\$" package 2>/dev/null \
+                  | sed 's/^/      /' || true
+                grep -lE "^PKG_NAME[[:space:]]*:=[[:space:]]*${pkg}[[:space:]]*\$" package/feeds/*/*/Makefile 2>/dev/null \
+                  | sed 's/^/      (feeds) /' || true
+                echo "  [4] 目录名等于该包名的位置"
+                find package -maxdepth 3 -name "$pkg" 2>/dev/null | sed 's/^/      /'
+              done
+            fi
+
+            echo ""
+            echo "==================================================================="
+            echo "  修复方向："
+            echo "    · package/ 下同一个包名只允许存在一份实现；"
+            echo "    · 第三方插件落地目录名必须与其 Makefile 声明的包名一致"
+            echo "      （OAF：oaf→kmod-oaf、open-app-filter→appfilter）；"
+            echo "    · 修正后重新触发编译，绝不带病编译。"
+            echo "==================================================================="
+            exit 1
+          fi
+          echo "==> kconfig 解析正常：无递归依赖、无 error"
 
           fail=0
           check() {
@@ -414,6 +514,34 @@ jobs:
               printf '    [OK]   CONFIG_%s 已关闭\n' "$sym"
             fi
           done
+
+          # ------------------------------------------------------------
+          # 第 2 关：config/X86_64.config 里声明的软件包是否还在 .config 里
+          #   defconfig 对「不存在 / 依赖条件不满足」的配置项是静默丢弃的。
+          #   软件包一旦被丢弃，编译照样能一路成功，直到 2 小时后
+          #   verify-packages.sh 才发现「插件一个都没有」—— 这里把它
+          #   提前到几分钟内发现，绝不浪费一次完整编译。
+          # ------------------------------------------------------------
+          echo ""
+          echo "==> 复核 config 里声明的软件包未被 make defconfig 静默丢弃"
+          mapfile -t want_pkgs < <(grep -E '^CONFIG_PACKAGE_[A-Za-z0-9_.+-]+=y$' \
+            "$GITHUB_WORKSPACE/$CONFIG_FILE" | sort -u)
+          lost_pkgs=()
+          for line in "${want_pkgs[@]}"; do
+            grep -qxF "$line" .config || lost_pkgs+=("$line")
+          done
+          if [ "${#lost_pkgs[@]}" -gt 0 ]; then
+            printf '    [丢失] 共 %d 个声明的软件包未进入最终 .config：\n' "${#lost_pkgs[@]}"
+            printf '             %s\n' "${lost_pkgs[@]}"
+            echo "           常见原因："
+            echo "             1) 该包在 openwrt-24.10 / 对应 feed 中不存在（名称写错）；"
+            echo "             2) 该包依赖的另一个包缺失，导致整条依赖链被丢弃；"
+            echo "             3) 同名包在源码树里存在两份定义，kconfig 报递归依赖"
+            echo "                并把全部包选择重置为默认值。"
+            fail=1
+          else
+            printf '    [OK]   %d 个声明的软件包全部保留\n' "${#want_pkgs[@]}"
+          fi
 
           # 留一份最终 .config 给失败诊断包
           cp -f .config "$GITHUB_WORKSPACE/final.config"

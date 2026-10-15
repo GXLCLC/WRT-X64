@@ -37,15 +37,17 @@ DEST_DIR="package/thirdparty"
 #   · luci-app-turboacc —— 只有 chenmozhijin 的 luci 分支适配 firewall4
 #     (nftables)，ImmortalWrt 源码不含该插件。
 #   · OAF —— destan19/OpenAppFilter 一个仓库含三个子包，必须全拉：
-#       oaf/             → kmod-oaf      内核模块
-#       open-app-filter/ → appfilter     用户态服务
-#       luci-app-oaf/    → luci-app-oaf  LuCI 面板（依赖前两者）
+#       oaf/             → 包名 kmod-oaf   内核模块（KernelPackage/oaf）
+#       open-app-filter/ → 包名 appfilter  用户态服务
+#       luci-app-oaf/    → 包名 luci-app-oaf  LuCI 面板（依赖前两者）
+#     注意落地目录名一律用「包名」，不要沿用上游目录名 ——
+#     目录名与包名不一致会让同名包校验失效，进而出现重复定义。
 # ----------------------------------------------------------------
 FORCE_SOURCES=(
   "luci-app-adguardhome|https://github.com/kenzok8/openwrt-packages|master|luci-app-adguardhome"
   "adguardhome|https://github.com/kenzok8/openwrt-packages|master|adguardhome"
   "luci-app-turboacc|https://github.com/chenmozhijin/turboacc|luci|luci-app-turboacc"
-  "oaf|https://github.com/destan19/OpenAppFilter|master|oaf"
+  "kmod-oaf|https://github.com/destan19/OpenAppFilter|master|oaf"
   "appfilter|https://github.com/destan19/OpenAppFilter|master|open-app-filter"
   "luci-app-oaf|https://github.com/destan19/OpenAppFilter|master|luci-app-oaf"
 )
@@ -139,6 +141,48 @@ remove_feed_links() {
   done
 }
 
+# ---------- 读取 Makefile 里真实声明的包名 ----------
+# 第三方仓库的「目录名」与「包名」经常不一致，destan19/OpenAppFilter
+# 就是典型：oaf/ → 包名 kmod-oaf，open-app-filter/ → 包名 appfilter。
+# 校验同名包必须按 Makefile 里声明的 PKG_NAME 来，取不到再退回目录名。
+declared_pkgname() {
+  local mk=$1 fallback=$2 name
+  name=$(grep -ohE '^PKG_NAME[[:space:]]*:=[[:space:]]*[^[:space:]]+' "$mk" 2>/dev/null |
+    head -n1 | sed -E 's/^PKG_NAME[[:space:]]*:=[[:space:]]*//')
+  # 含 $(...) 变量引用的不作数（如 luci.mk 的 PKG_NAME?=$(LUCI_NAME)）
+  case "$name" in *'$'*) name="" ;; esac
+  [ -n "$name" ] || name="$fallback"
+  printf '%s' "$name"
+}
+
+# ---------- 清除源码树里重复声明的同名包 ----------
+# 同一个包名在 package/ 下出现两份时，kconfig 会生成「自己 select 自己」
+# 的依赖，报：
+#   error: recursive dependency detected!
+#   symbol PACKAGE_xxx is selected by PACKAGE_xxx
+# 而 make defconfig 对此的反应是「退出码 0 + 把 .config 里的包选择整体
+# 重置为默认值」—— 现象就是「用户清单里的插件全部消失，但仍然能编译成功」。
+# FORCE_SOURCES 的语义是「以第三方版本为唯一实现」，所以这里把其它位置
+# 的同名实现直接删掉；feeds 源仓库本身不受影响（只删软链接/落地副本）。
+purge_duplicate_pkgname() {
+  local pkg=$1 keep=$2 mf d
+  [ -n "$pkg" ] || return 0
+  {
+    # 真实目录：ImmortalWrt 源码自带 / 已落地的第三方插件
+    grep -rlE "^PKG_NAME[[:space:]]*:=[[:space:]]*${pkg}[[:space:]]*\$" package 2>/dev/null || true
+    # feeds 软链接：grep -r 不跟随软链接，必须用通配符显式展开
+    grep -lE "^PKG_NAME[[:space:]]*:=[[:space:]]*${pkg}[[:space:]]*\$" \
+      package/feeds/*/*/Makefile 2>/dev/null || true
+  } | sed '/^$/d' | sort -u | while read -r mf; do
+    d=$(dirname "$mf")
+    if [ "$d" = "$keep" ]; then
+      continue
+    fi
+    echo "    清除重复的同名包（包名 $pkg）: $d"
+    rm -rf "$d"
+  done
+}
+
 # ---------- 浅克隆单个仓库并稀疏检出指定目录 ----------
 # 指定分支不存在时自动回退到仓库默认分支，避免上游改分支名直接炸掉。
 clone_repo() {
@@ -190,6 +234,18 @@ for line in "${FORCE_SOURCES[@]}"; do
   remove_feed_links "$pkg"
   REPO_PKGS["$repo|$branch"]+="$pkg:$subdir "
   PKG_REPO_REF["$pkg"]="$repo|$branch|$subdir"
+done
+
+# 2a-2. OAF 三件套的目录名与包名不一致的补漏清理（必须放在这里，
+# remove_feed_links 的定义在下方逻辑区）：
+#   oaf/             包名是 kmod-oaf
+#   open-app-filter/ 包名是 appfilter
+# feeds install 生成的软链接按「上游目录名」命名，只按包名删会漏，
+# 残留的 feeds 版与第三方版构成「同一个包名两份定义」，
+# kconfig 会报 recursive dependency，并把 .config 的包选择整体重置。
+for alias in oaf kmod-oaf open-app-filter appfilter luci-app-oaf \
+             luci-i18n-oaf-zh-cn luci-i18n-appfilter-zh-cn; do
+  remove_feed_links "$alias"
 done
 
 # 2b. 常规第三方包：源码已存在则跳过
@@ -251,6 +307,13 @@ for key in "${!REPO_PKGS[@]}"; do
       fail "$pkg" "$repo" "$branch" "$subdir" "目录内没有 Makefile，不是有效的 OpenWrt 软件包"
     fi
     echo "    已就位: $DEST_DIR/$pkg"
+
+    # 以落地目录里 Makefile 声明的真实包名为准，清掉源码树中其它同名实现，
+    # 保证「一个包名在 package/ 下只有一份定义」。
+    # 这是防止 kconfig 报 recursive dependency（自己 select 自己）的
+    # 最后一道闸门；报错后 defconfig 会把 .config 的包选择整体重置，
+    # 表现为「插件全丢但仍然编译成功」。
+    purge_duplicate_pkgname "$(declared_pkgname "$DEST_DIR/$pkg/Makefile" "$pkg")" "$DEST_DIR/$pkg"
   done
   rm -rf "$tmp"
 done
