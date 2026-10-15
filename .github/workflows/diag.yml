@@ -1,0 +1,145 @@
+# ================================================================
+# 临时诊断工作流（分析完毕后删除）
+#
+# 目的：查清 make defconfig 为何把 config/X86_64.config 里声明的插件
+#       静默丢弃（run #72 报告 23 个包丢失，且 defconfig 无任何报错）。
+#
+# 手段：分两个阶段跑 defconfig，隔离「第三方插件元数据」这一变量：
+#   阶段 A：纯 ImmortalWrt 官方 feeds（不引入任何第三方插件）
+#   阶段 B：叠加 package/thirdparty/ 第三方插件后
+# 并 dump tmp/.config-package.in 中被丢弃符号的完整 config 块
+# （prompt / depends on / select），直接暴露是哪条依赖不成立。
+# ================================================================
+name: DIAG
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential gawk gettext git \
+            libncurses-dev libssl-dev zlib1g-dev python3 python3-setuptools \
+            rsync unzip file wget curl patch time
+
+      - name: 克隆源码
+        run: |
+          git clone --depth 1 --single-branch --branch openwrt-24.10 \
+            https://github.com/immortalwrt/immortalwrt src
+          cd src && git log -1 --format='%h %cd' --date=short
+
+      - name: 更新 feeds
+        run: |
+          cd src
+          ./scripts/feeds update -a 2>&1 | tail -20
+          ./scripts/feeds install -a 2>&1 | tail -5
+
+      - name: 阶段A - 纯官方 feeds 跑 defconfig
+        run: |
+          cd src
+          cp ../config/X86_64.config .config
+          cp .config ../A_input.config
+          make defconfig > ../A_defconfig.out 2>&1 || echo "rc=$?"
+          cp .config ../A_result.config
+          cp tmp/.config-package.in ../A_pkg.in 2>/dev/null || true
+          echo "=== 阶段A defconfig 输出 ==="
+          cat ../A_defconfig.out
+
+      - name: 阶段B - 叠加第三方插件后跑 defconfig
+        run: |
+          cd src
+          bash scripts/feeds_update.sh > ../B_feeds.log 2>&1 || echo "feeds_update rc=$?"
+          tail -30 ../B_feeds.log
+          cp ../config/X86_64.config .config
+          rm -rf tmp/.config-package.in tmp/.packageinfo
+          make defconfig > ../B_defconfig.out 2>&1 || echo "rc=$?"
+          cp .config ../B_result.config
+          cp tmp/.config-package.in ../B_pkg.in 2>/dev/null || true
+          echo "=== 阶段B defconfig 输出 ==="
+          cat ../B_defconfig.out
+
+      - name: 分析被丢弃的符号
+        run: |
+          set +e
+          WS="$GITHUB_WORKSPACE"
+          WANT=$(grep -E '^CONFIG_PACKAGE_[A-Za-z0-9_.+-]+=y$' "$WS/config/X86_64.config" | sed 's/^CONFIG_//;s/=y$//')
+
+          for phase in A B; do
+            echo ""
+            echo "################################################################"
+            echo "##  阶段 $phase ：被丢弃的符号"
+            echo "################################################################"
+            for sym in $WANT; do
+              if ! grep -qxF "CONFIG_$sym=y" "$WS/${phase}_result.config"; then
+                state=$(grep -m1 -E "^# ?CONFIG_${sym} is not set" "$WS/${phase}_result.config")
+                if [ -n "$state" ]; then
+                  echo "  [丢] $sym  （符号存在，但被置为 n）"
+                else
+                  echo "  [缺] $sym  （符号在 .config 中根本不存在 → 该包未定义）"
+                fi
+              fi
+            done
+            echo "";
+            echo "---- 阶段 $phase 关键符号的 config 块（来自 tmp/.config-package.in）----"
+            for sym in PACKAGE_luci-app-mwan3 PACKAGE_luci-theme-argon \
+                       PACKAGE_luci-app-openclash PACKAGE_luci-app-smartdns \
+                       PACKAGE_luci-i18n-mwan3-zh-cn PACKAGE_luci-app-turboacc \
+                       PACKAGE_luci-app-adguardhome PACKAGE_adguardhome; do
+              f="$WS/${phase}_pkg.in"
+              [ -f "$f" ] || continue
+              echo "===== $sym ====="
+              awk -v key="config $sym\$" '
+                $0 ~ key { f=1 }
+                f && $0 ~ /^config / && $0 !~ key { exit }
+                f { print "      " $0 }
+              ' "$f" | head -30
+              echo "      --- 该符号被引用的 depends 行 ---"
+              grep -nE "depends on .*${sym#PACKAGE_}" "$f" | head -5
+              # 统计该符号在文件中出现的 config 块数量（重复定义检测）
+              echo "      [出现次数] $(grep -cE "^config ${sym}\$" "$f")"
+            done
+          done
+
+          echo ""
+          echo "################################################################"
+          echo "##  阶段B 中 luci feed 全部 luci-app-* 符号是否存在于 pkg.in"
+          echo "################################################################"
+          for n in luci-app-mwan3 luci-theme-argon luci-app-nlbwmon luci-app-smartdns luci-app-openclash; do
+            printf '  %-28s 在 packageinfo: %s   在 pkg.in: %s\n' "$n" \
+              "$(grep -c "^Package: $n\$" "$WS/B_pkg.in" 2>/dev/null)" \
+              "$(grep -cE "^config PACKAGE_$n\$" "$WS/B_pkg.in" 2>/dev/null)"
+          done
+
+          echo ""
+          echo "=== 阶段B defconfig 中的 WARNING/error ==="
+          grep -iE "warning|error" "$WS/B_defconfig.out" | head -60
+          echo "=== 阶段A defconfig 中的 WARNING/error ==="
+          grep -iE "warning|error" "$WS/A_defconfig.out" | head -60
+
+      - name: 上传诊断产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag-${{ github.run_number }}
+          path: |
+            A_input.config
+            A_result.config
+            A_defconfig.out
+            B_result.config
+            B_defconfig.out
+            B_feeds.log
+            A_pkg.in
+            B_pkg.in
+          if-no-files-found: warn
+          retention-days: 7
