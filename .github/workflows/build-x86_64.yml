@@ -456,6 +456,57 @@ jobs:
           rm -rf package/turboacc
           bash /tmp/add_turboacc.sh ${EXTRA}
 
+          # ---- 修复：turboacc 952 补丁与 ImmortalWrt 24.10 原生 952 补丁并存冲突 ----
+          # 背景：ImmortalWrt openwrt-24.10 已原生内置
+          #       target/linux/generic/hack-6.6/952-net-conntrack-events-support-multiple-registrant.patch
+          #       （功能相同：net: conntrack events, support multiple registrant，
+          #        并已随内核 6.6.157 持续适配）。
+          # 而 add_turboacc.sh 只按自己仓库的文件名
+          #       952-add-net-conntrack-events-support-multiple-registrant.patch
+          #       做存在性删除，不会移除 ImmortalWrt 原生 952 补丁。
+          # 结果：两个 952 补丁按字典序先后全部应用，后者在已被前者修改的
+          #       nf_conntrack_ecache / conntrack.h / nf_conntrack_netlink 上
+          #       7 个 hunk 全部失败 → toolchain/kernel-headers 构建中断。
+          # 修复：删除 turboacc 带来的重复补丁，保留 ImmortalWrt 原生版本
+          #       （原生版本与源码内核严格匹配，功能完全等价）。
+          TURBOACC_952="target/linux/generic/hack-6.6/952-add-net-conntrack-events-support-multiple-registrant.patch"
+          NATIVE_952="target/linux/generic/hack-6.6/952-net-conntrack-events-support-multiple-registrant.patch"
+          if [ -f "${TURBOACC_952}" ]; then
+            echo "检测到 turboacc 注入的重复 952 补丁，已移除（保留 ImmortalWrt 原生版本）：${TURBOACC_952}"
+            rm -f "${TURBOACC_952}"
+          fi
+          # 校验 1：ImmortalWrt 原生 952 补丁必须存在（是 chain events 功能的来源）
+          if [ ! -f "${NATIVE_952}" ]; then
+            echo "==================== TurboAcc 集成失败 ===================="
+            echo "插件 / 组件   : TurboAcc（内核补丁 952 冲突修复）"
+            echo "失败阶段      : 补丁一致性校验"
+            echo "来源仓库      : ${{ env.SOURCE_REPO }}（分支 ${{ env.SOURCE_BRANCH }}）"
+            echo "期望路径      : ${NATIVE_952}"
+            echo "实际检测结果  : 文件不存在"
+            echo "可能原因      : 上游 openwrt-24.10 分支调整了 hack-6.6 补丁命名或移除了"
+            echo "                952 补丁；此时 turboacc 注入版本与上游内核的适配性未知。"
+            echo "建议修复方向  : 核对上游 hack-6.6 目录实际内容，确认 952 补丁新路径后"
+            echo "                同步更新 NATIVE_952 与 TURBOACC_952 两个变量。"
+            echo "========================================================="
+            echo "::error::ImmortalWrt 原生 952 补丁缺失，无法保证 chain events 功能"
+            exit 1
+          fi
+          # 校验 2：hack-6.6 下不允许同时存在多个 952 系列补丁（防止上游再次改名后冲突复发）
+          COUNT_952="$(find target/linux/generic/hack-6.6 -maxdepth 1 -name '952-*.patch' 2>/dev/null | wc -l)"
+          if [ "${COUNT_952}" -ne 1 ]; then
+            echo "==================== TurboAcc 集成失败 ===================="
+            echo "插件 / 组件   : TurboAcc（内核补丁 952 冲突修复）"
+            echo "失败阶段      : 补丁唯一性校验"
+            echo "期望结果      : hack-6.6 目录中 952-*.patch 数量 = 1（仅 ImmortalWrt 原生）"
+            echo "实际检测结果  : ${COUNT_952} 个"
+            echo "当前 952 补丁 : $(ls -1 target/linux/generic/hack-6.6/952-*.patch 2>/dev/null | tr '\n' ' ')"
+            echo "可能原因      : turboacc 又注入了新的 952 补丁变体，或上游原生补丁改名。"
+            echo "========================================================="
+            echo "::error::hack-6.6 中存在多个 952 补丁，编译必然冲突"
+            exit 1
+          fi
+          echo "952 补丁冲突修复完成：仅保留 ImmortalWrt 原生版本"
+
           # 校验 turboacc 落位结果
           if [ ! -f package/turboacc/luci-app-turboacc/Makefile ]; then
             echo "==================== TurboAcc 集成失败 ===================="
