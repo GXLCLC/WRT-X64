@@ -1,0 +1,72 @@
+# ---------------------------------------------------------------------------
+# 必选软件包清单（用于编译前后双重校验）
+#
+# 编译前：在 make defconfig 之后，检查 .config 中这些包是否全部解析成功；
+# 编译后：在固件 manifest 中检查这些包是否全部真实打进固件。
+#
+# 任一项缺失 -> 工作流立即终止，并输出缺失包名与排查建议。
+# 每行一个包名；"#" 开头为注释；kmod 内核模块也在此列出，用于确保驱动真的编译进去了。
+# ---------------------------------------------------------------------------
+
+# ---- 1. SmartDNS ----
+smartdns
+luci-app-smartdns
+luci-i18n-smartdns-zh-cn
+
+# ---- 2. DDNSTO 内网穿透 ----
+ddnsto
+luci-app-ddnsto
+luci-i18n-ddnsto-zh-cn
+
+# ---- 3. AdGuardHome（LuCI 面板 + 核心二进制预置于 files/usr/bin/AdGuardHome） ----
+luci-app-adguardhome
+
+# ---- 4. OAF 应用过滤 ----
+luci-app-oaf
+luci-i18n-oaf-zh-cn
+kmod-oaf
+appfilter
+
+# ---- 5. TurboAcc 加速 ----
+luci-app-turboacc
+luci-i18n-turboacc-zh-cn
+kmod-tcp-bbr
+kmod-nft-offload
+kmod-nft-fullcone
+
+# ---- 6. Mwan3 多拨 ----
+mwan3
+luci-app-mwan3
+luci-i18n-mwan3-zh-cn
+
+# ---- 7. argon 主题（系统默认） ----
+luci-theme-argon
+
+# ---- 8. argon 主题配置 ----
+luci-app-argon-config
+luci-i18n-argon-config-zh-cn
+
+# ---- 9. nlbwmon 带宽监控 ----
+nlbwmon
+luci-app-nlbwmon
+luci-i18n-nlbwmon-zh-cn
+
+# ---- 10. EasyTier 组网 ----
+easytier
+luci-app-easytier
+luci-i18n-easytier-zh-cn
+
+# ---- 11. OpenClash 代理插件（仅此一个代理类插件） ----
+luci-app-openclash
+
+# ---- 关键内核模块：USB 驱动 ----
+kmod-usb2
+kmod-usb3
+kmod-usb-storage
+kmod-usb-hid
+
+# ---- 关键内核模块：USB 网卡驱动 ----
+kmod-usb-net
+kmod-usb-net-asix
+kmod-usb-net-asix-ax88179
+kmod-usb-net-rtl8152-vendor

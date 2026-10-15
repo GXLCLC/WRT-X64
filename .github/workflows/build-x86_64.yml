@@ -1,0 +1,955 @@
+# =============================================================================
+# ImmortalWrt X86_64 云编译工作流
+# -----------------------------------------------------------------------------
+# 设计参考 GitHub 上 P3TERX 的云编译仓库模式，结合本仓库的具体要求实现。
+#
+# 核心约束（与需求一一对应）：
+#   1. 仅 workflow_dispatch 手动触发，无 push / schedule 自动触发
+#   2. 源码固定 immortalwrt/immortalwrt 的 openwrt-24.10 分支
+#   3. 编译环境固定 Ubuntu 24.04 LTS（ubuntu-24.04）
+#   4. 仅编译 X86_64 架构，仅产出 squashfs-combined.img
+#   5. 时区 Asia/Shanghai、argon 为默认主题
+#   6. 第三方插件按“稀疏浅克隆 + 路径/分支校验”拉取，校验失败立即终止
+#   7. 编译严格模式：任一软件包编译失败立即终止
+#   8. 失败时上传完整日志；成功后自动创建 Release（仅上传 squashfs-combined.img）
+# =============================================================================
+
+name: 编译 ImmortalWrt X86_64 固件
+
+# =============================================================================
+# 触发方式：仅支持手动触发（workflow_dispatch）
+#   刻意不配置 push / pull_request / schedule，避免误触发与无谓的编译消耗。
+# =============================================================================
+on:
+  workflow_dispatch:
+    inputs:
+      include_sfe:
+        description: "TurboAcc 是否额外集成 Shortcut-FE（默认关闭：仅软件流量分载 + 全锥型 NAT + BBR）"
+        required: false
+        type: boolean
+        default: false
+      upload_artifact:
+        description: "是否把固件同时作为 Actions Artifact 上传（Release 始终只发布 squashfs-combined.img）"
+        required: false
+        type: boolean
+        default: true
+
+# =============================================================================
+# 权限：授予仓库写权限，允许工作流自动创建 Release
+# =============================================================================
+permissions:
+  contents: write
+
+# =============================================================================
+# 全局常量（第三方仓库地址与分支集中在此，便于上游变更时统一修改）
+# =============================================================================
+env:
+  SOURCE_REPO: https://github.com/immortalwrt/immortalwrt.git
+  SOURCE_BRANCH: openwrt-24.10
+  SRC_DIR: immortalwrt
+  KENZOK8_PACKAGES: https://github.com/kenzok8/openwrt-packages.git
+  KENZOK8_PACKAGES_BRANCH: master
+  KENZOK8_SMALL: https://github.com/kenzok8/small-package.git
+  KENZOK8_SMALL_BRANCH: main
+  DESTAN_OAF: https://github.com/destan19/OpenAppFilter.git
+  DESTAN_OAF_BRANCH: master
+  TURBOACC_REPO: https://github.com/chenmozhijin/turboacc.git
+  TURBOACC_BRANCH: luci
+  ADGUARD_VERSION: "0.107.79"
+  LAN_IP: 192.168.2.1
+  ROOT_PASSWORD: "12345678"
+
+jobs:
+  build:
+    name: 编译 X86_64 固件
+    # 固定使用 Ubuntu 24.04 LTS 编译环境
+    runs-on: ubuntu-24.04
+    # 完整编译（含工具链）耗时较长，超时上限设为 6 小时
+    timeout-minutes: 360
+
+    steps:
+      # ---------------------------------------------------------------------
+      # 步骤 1：打印本次构建的上下文信息
+      #   目的：把运行环境、触发参数、源码分支等固化到日志开头，
+      #         日后排查任何一次构建都能直接看到当时的输入条件。
+      # ---------------------------------------------------------------------
+      - name: 步骤 1 - 输出构建环境与触发参数
+        run: |
+          set -euo pipefail
+          echo "==================== 构建上下文 ===================="
+          echo "运行环境    : $(lsb_release -ds 2>/dev/null || head -1 /etc/os-release)"
+          echo "运行内核    : $(uname -r)"
+          echo "CPU 核心数  : $(nproc)"
+          echo "触发用户    : ${{ github.actor }}"
+          echo "触发事件    : ${{ github.event_name }}"
+          echo "工作流编号  : ${{ github.run_number }}"
+          echo "源码仓库    : ${{ env.SOURCE_REPO }} @ ${{ env.SOURCE_BRANCH }}"
+          echo "TurboACC SFE: ${{ inputs.include_sfe }}"
+          echo "上传 Artifact: ${{ inputs.upload_artifact }}"
+          echo "磁盘使用情况:"
+          df -h /
+          echo "==================================================="
+
+      # ---------------------------------------------------------------------
+      # 步骤 2：检出本仓库
+      #   目的：把 config/（固件配置）与 scripts/（校验脚本）取到工作区。
+      # ---------------------------------------------------------------------
+      - name: 步骤 2 - 检出本仓库（获取 config 与 scripts）
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------------
+      # 步骤 3：释放磁盘空间
+      #   目的：GitHub 托管 runner 默认根分区偏小，而 ImmortalWrt 全量编译
+      #         需要 20G 以上空间；这里删除与编译无关的预装组件以保证编译不中断。
+      # ---------------------------------------------------------------------
+      - name: 步骤 3 - 释放磁盘空间（腾出编译所需空间）
+        run: |
+          set -euo pipefail
+          echo "清理前磁盘使用："
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/lib/jvm /usr/share/swift /opt/microsoft /opt/google \
+                      /usr/local/lib/heroku /usr/local/share/chromium* || true
+          sudo apt-get clean || true
+          docker image prune -af || true
+          # 补充 swap：ruby / appfilter 等包编译时内存占用较高，
+          # GitHub runner 默认内存 16G，追加 8G swap 作为 OOM 保险（磁盘富余，代价很小）
+          sudo swapoff -a || true
+          sudo rm -f /swapfile
+          sudo fallocate -l 8G /swapfile 2>/dev/null || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile >/dev/null
+          sudo swapon /swapfile || echo "::warning::swap 启用失败，继续编译（不阻断）"
+          free -h
+          echo "清理后磁盘使用："
+          df -h /
+
+      # ---------------------------------------------------------------------
+      # 步骤 4：安装编译依赖
+      #   目的：安装 OpenWrt/ImmortalWrt 构建所需的工具链与宿主依赖，
+      #         以及后续校验镜像分区所需的 util-linux 工具。
+      # ---------------------------------------------------------------------
+      - name: 步骤 4 - 安装编译依赖
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get -y install \
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+            build-essential bzip2 ccache cmake cpio curl device-tree-compiler \
+            diffstat dosfstools file flex g++ g++-multilib gawk gcc-multilib \
+            gettext git gperf haveged help2man intltool libc6-dev-i386 \
+            lib32gcc-s1 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev \
+            libmpc-dev libmpfr-dev libncurses-dev libncursesw5-dev \
+            libreadline-dev libssl-dev libtool libtool-bin \
+            mtools nano ninja-build patch pkgconf \
+            python3 python3-dev python3-docutils python3-pip python3-ply \
+            python3-pyelftools python3-setuptools \
+            qemu-utils quilt re2c rsync scons squashfs-tools subversion swig \
+            texinfo time unzip util-linux uuid-dev vim wget xmlto xsltproc \
+            zip zlib1g-dev zstd
+          # 部分旧脚本仍引用 libncurses5-dev，24.04 上可能已被合并，允许失败
+          sudo apt-get -y install libncurses5-dev || true
+          echo "已安装的编译工具版本："
+          gcc --version | head -1
+          clang --version | head -1
+          python3 --version
+
+      # ---------------------------------------------------------------------
+      # 步骤 5：拉取 ImmortalWrt 官方源码
+      #   目的：固定使用 openwrt-24.10 分支的官方源码作为编译基线。
+      #         先校验分支可达性，再浅克隆；分支不存在则立即终止并输出定位信息。
+      # ---------------------------------------------------------------------
+      - name: 步骤 5 - 拉取 ImmortalWrt 源码（openwrt-24.10）
+        run: |
+          set -euo pipefail
+          SRC_DIR="${{ env.SRC_DIR }}"
+          rm -rf "$SRC_DIR"
+
+          # 校验上游分支是否存在（fail fast，避免后面几百行日志才暴露问题）
+          if ! git ls-remote --exit-code --heads "${{ env.SOURCE_REPO }}" "${{ env.SOURCE_BRANCH }}" >/dev/null 2>&1; then
+            echo ""
+            echo "==================== 上游源码拉取校验失败 ===================="
+            echo "缺失项       : 远端分支"
+            echo "来源仓库     : ${{ env.SOURCE_REPO }}"
+            echo "期望分支     : ${{ env.SOURCE_BRANCH }}"
+            echo "检测命令     : git ls-remote --exit-code --heads ${{ env.SOURCE_REPO }} ${{ env.SOURCE_BRANCH }}"
+            echo "实际检测结果 : 非 0 退出码（分支不存在或仓库不可访问）"
+            echo "可能原因     : 1) 上游仓库改名/迁移；2) 分支已被删除或重命名；3) 网络不可达。"
+            echo "建议修复方向 : 浏览器打开 ${{ env.SOURCE_REPO }} 确认分支名，"
+            echo "               然后修改 .github/workflows/build-x86_64.yml 顶部的 SOURCE_BRANCH。"
+            echo "============================================================="
+            echo "::error::ImmortalWrt 源码分支 ${{ env.SOURCE_BRANCH }} 不存在或不可访问"
+            exit 1
+          fi
+
+          # 浅克隆：只需要 openwrt-24.10 分支的最新一次提交，节省时间与空间
+          git clone --depth 1 --branch "${{ env.SOURCE_BRANCH }}" \
+            "${{ env.SOURCE_REPO }}" "$SRC_DIR"
+
+          # 记录源码提交，供 Release 说明与追溯使用
+          git -C "$SRC_DIR" rev-parse HEAD > "$GITHUB_WORKSPACE/.immortalwrt-sha"
+          echo "源码提交 : $(cat "$GITHUB_WORKSPACE/.immortalwrt-sha")"
+          echo "内核补丁版本 : $(sed -n 's/^KERNEL_PATCHVER:=\(.*\)$/\1/p' "$SRC_DIR/target/linux/x86/Makefile" | tr -d ' \r')"
+          echo "源码目录大小 : $(du -sh "$SRC_DIR" | cut -f1)"
+
+      # ---------------------------------------------------------------------
+      # 步骤 6：更新并安装软件包源（feeds）
+      #   目的：拉取并安装 ImmortalWrt 自带的 packages / luci / routing / telephony
+      #         等 feed，优先使用源码自带软件包，减少第三方依赖。
+      #   说明：feeds.conf 中 src-git 即为浅克隆，无需额外优化。
+      # ---------------------------------------------------------------------
+      - name: 步骤 6 - 更新并安装软件包源（feeds）
+        working-directory: immortalwrt
+        run: |
+          set -euo pipefail
+          echo "当前 feeds 配置："
+          cat feeds.conf.default
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          echo "已安装的 feed 包数量： $(find package/feeds -maxdepth 2 -name Makefile | wc -l)"
+
+      # ---------------------------------------------------------------------
+      # 步骤 7：拉取第三方插件（仅 ImmortalWrt 源码缺失的包）
+      #   目的：以「浅克隆 + 稀疏检出」方式只取需要的子目录，不整仓库拉取；
+      #         拉取前校验分支可达性、子目录存在性、包定义文件存在性。
+      #   规则：任一项校验失败立即终止，并输出插件名、来源仓库、期望路径、
+      #         实际检测结果、可能原因与建议修复方向。
+      # ---------------------------------------------------------------------
+      - name: 步骤 7 - 拉取第三方插件并做路径/依赖校验
+        run: |
+          set -euo pipefail
+          IW="$(pwd)/${{ env.SRC_DIR }}"
+          WORK="$(mktemp -d)"
+          trap 'rm -rf "$WORK"' EXIT
+
+          # ---- 结构化失败输出：统一格式便于定位 ----
+          fail_pull() {
+            local plugin="$1" stage="$2" repo="$3" expect="$4" actual="$5" reason="$6" fix="$7"
+            {
+              echo ""
+              echo "==================== 第三方插件拉取校验失败 ===================="
+              echo "插件 / 组件   : ${plugin}"
+              echo "失败阶段      : ${stage}"
+              echo "来源仓库      : ${repo}"
+              echo "期望路径/分支 : ${expect}"
+              echo "实际检测结果  : ${actual}"
+              echo "可能原因      : ${reason}"
+              echo "建议修复方向  : ${fix}"
+              echo "=============================================================="
+            } >&2
+            echo "::error::[${plugin}] ${stage} 失败：${actual}"
+            exit 1
+          }
+
+          # ---- 稀疏浅克隆：只拉取指定子目录，stdout 仅输出本地路径 ----
+          # 用法：sparse_pull <插件名> <仓库> <分支> <本地目录名> <稀疏路径...> [-- <探针文件...>]
+          #   探针文件缺省时，默认校验每个稀疏路径下的 Makefile；
+          #   若插件在第三方仓库里是「容器目录」（顶层没有 Makefile），
+          #   则在 "--" 之后显式列出必须存在的文件。
+          sparse_pull() {
+            local plugin="$1" repo="$2" branch="$3" outdir="$4"
+            shift 4
+            local -a paths=() probes=()
+            local seen_sep=0 a
+            for a in "$@"; do
+              if [ "$a" = "--" ]; then seen_sep=1; continue; fi
+              if [ "$seen_sep" = "1" ]; then probes+=("$a"); else paths+=("$a"); fi
+            done
+            if [ "${#probes[@]}" -eq 0 ]; then
+              local p
+              for p in "${paths[@]}"; do probes+=("${p}/Makefile"); done
+            fi
+            local dir="${WORK}/${outdir}"
+
+            echo "[${plugin}] 校验远端分支：${repo} @ ${branch}" >&2
+            if ! git ls-remote --exit-code --heads "$repo" "$branch" >/dev/null 2>&1; then
+              fail_pull "$plugin" "远端分支可达性校验" "$repo" "分支 ${branch} 存在" \
+                "分支 ${branch} 不存在或仓库不可访问" \
+                "上游仓库改名/删库/默认分支调整，或网络不可达" \
+                "打开 ${repo} 确认分支名，同步修改工作流顶部的分支变量"
+            fi
+
+            if ! git clone --depth 1 --filter=blob:none --no-checkout \
+                 --branch "$branch" "$repo" "$dir" >&2; then
+              fail_pull "$plugin" "浅克隆" "$repo" "浅克隆到 ${dir}" "git clone 返回非 0" \
+                "网络抖动、GitHub 限流或仓库临时不可用" \
+                "重跑工作流；若持续失败，可在本地执行相同命令复现并查看详细报错"
+            fi
+
+            git -C "$dir" sparse-checkout init --cone >&2 || true
+            if ! git -C "$dir" sparse-checkout set "${paths[@]}" >&2; then
+              fail_pull "$plugin" "稀疏检出" "$repo" "子目录 ${paths[*]} 存在" \
+                "git sparse-checkout set 返回非 0" \
+                "分支上不存在这些子目录路径" \
+                "在 ${repo} 的 ${branch} 分支上确认目录名后，同步修改本步骤中的路径参数"
+            fi
+            git -C "$dir" checkout >&2 || true
+
+            local q
+            for q in "${probes[@]}"; do
+              if [ ! -e "${dir}/${q}" ]; then
+                fail_pull "$plugin" "目标路径存在性校验" "$repo" \
+                  "${branch}:${q} 存在" "${q} 未检出" \
+                  "上游目录被重命名/移动，或该包未适配 openwrt-24.10" \
+                  "访问 ${repo}/tree/${branch}/${q} 确认路径后同步修改本步骤"
+              fi
+            done
+
+            echo "[${plugin}] 路径校验通过：${repo} @ ${branch} -> ${paths[*]}" >&2
+            echo "$dir"
+          }
+
+          mkdir -p "$IW/package"
+
+          # ---- 7.1 luci-app-adguardhome（kenzok8/openwrt-packages） ----
+          # LuCI 前端 + 中文文案内置；AdGuardHome 核心二进制在步骤 9 预置。
+          d="$(sparse_pull "luci-app-adguardhome" "${{ env.KENZOK8_PACKAGES }}" \
+                "${{ env.KENZOK8_PACKAGES_BRANCH }}" adg luci-app-adguardhome)"
+          rm -rf "$IW/package/luci-app-adguardhome"
+          cp -rf "$d/luci-app-adguardhome" "$IW/package/luci-app-adguardhome"
+
+          # ---- 7.2 ddnsto + luci-app-ddnsto（含 zh-cn 语言包） ----
+          d="$(sparse_pull "ddnsto/luci-app-ddnsto" "${{ env.KENZOK8_PACKAGES }}" \
+                "${{ env.KENZOK8_PACKAGES_BRANCH }}" ddnsto ddnsto luci-app-ddnsto)"
+          rm -rf "$IW/package/ddnsto" "$IW/package/luci-app-ddnsto"
+          cp -rf "$d/ddnsto" "$IW/package/ddnsto"
+          cp -rf "$d/luci-app-ddnsto" "$IW/package/luci-app-ddnsto"
+
+          # ---- 7.3 OAF：kmod-oaf + luci-app-oaf（kenzok8/small-package） ----
+          # 前后端配套：luci-app-oaf 依赖 kmod-oaf（内核过滤模块）与 appfilter（用户态服务）
+          d="$(sparse_pull "oaf/luci-app-oaf" "${{ env.KENZOK8_SMALL }}" \
+                "${{ env.KENZOK8_SMALL_BRANCH }}" oaf oaf luci-app-oaf)"
+          rm -rf "$IW/package/oaf" "$IW/package/luci-app-oaf"
+          cp -rf "$d/oaf" "$IW/package/oaf"
+          cp -rf "$d/luci-app-oaf" "$IW/package/luci-app-oaf"
+
+          # ---- 7.4 appfilter 用户态服务（destan19/OpenAppFilter，OAF 官方上游） ----
+          # 说明：kenzok8 的两个仓库均不含 appfilter 包，而 luci-app-oaf 显式依赖
+          #       +appfilter，缺少它会导致 defconfig 剔除插件，故必须补充此来源。
+          d="$(sparse_pull "appfilter" "${{ env.DESTAN_OAF }}" \
+                "${{ env.DESTAN_OAF_BRANCH }}" appfilter open-app-filter)"
+          rm -rf "$IW/package/appfilter"
+          cp -rf "$d/open-app-filter" "$IW/package/appfilter"
+
+          # ---- 7.5 OpenClash（kenzok8/small-package） ----
+          # 仅集成这一个代理类插件。
+          d="$(sparse_pull "luci-app-openclash" "${{ env.KENZOK8_SMALL }}" \
+                "${{ env.KENZOK8_SMALL_BRANCH }}" openclash luci-app-openclash)"
+          rm -rf "$IW/package/luci-app-openclash"
+          cp -rf "$d/luci-app-openclash" "$IW/package/luci-app-openclash"
+
+          # ---- 7.6 EasyTier（kenzok8/small-package，容器目录含内核与 LuCI） ----
+          # 注意：该仓库里的 luci-app-easytier 是「容器目录」，顶层没有 Makefile，
+          #   其内部结构为：
+          #     easytier/           —— EasyTier 本体（PKG_NAME:=easytier，含核心二进制安装）
+          #     luci-app-easytier/  —— LuCI 前端（LUCI_NAME:=luci-app-easytier）
+          #     easytier-noweb/     —— 不带 Web 控制台的版本
+          #     version.mk          —— 内层两个 Makefile 都以 `../version.mk` 引用它
+          #   因此必须整容器拷贝到 package/luci-app-easytier/ 下，保留 version.mk 的
+          #   父目录关系；源码的包扫描深度为 5 层（见 include/toplevel.mk SCAN_DEPTH=5），
+          #   嵌套两层的内层 Makefile 会被正常发现。
+          # 依赖说明：luci-app-easytier 的 LUCI_DEPENDS 不含 +easytier，
+          #           故 config/X86_64.config 中必须显式选中 easytier 本体。
+          d="$(sparse_pull "easytier" "${{ env.KENZOK8_SMALL }}" \
+                "${{ env.KENZOK8_SMALL_BRANCH }}" easytier luci-app-easytier \
+                -- luci-app-easytier/version.mk \
+                   luci-app-easytier/luci-app-easytier/Makefile \
+                   luci-app-easytier/easytier/Makefile)"
+          rm -rf "$IW/package/luci-app-easytier"
+          cp -rf "$d/luci-app-easytier" "$IW/package/luci-app-easytier"
+
+          echo ""
+          echo "==================== 第三方插件落位结果 ===================="
+          for p in package/luci-app-adguardhome/Makefile \
+                   package/ddnsto/Makefile \
+                   package/luci-app-ddnsto/Makefile \
+                   package/oaf/Makefile \
+                   package/luci-app-oaf/Makefile \
+                   package/appfilter/Makefile \
+                   package/luci-app-openclash/Makefile \
+                   package/luci-app-easytier/luci-app-easytier/Makefile \
+                   package/luci-app-easytier/easytier/Makefile; do
+            if [ -f "$IW/$p" ]; then
+              printf '  [OK]   %s\n' "$p"
+            else
+              printf '  [FAIL] %s\n' "$p"
+              echo "::error::插件未正确落位到 $p"
+              exit 1
+            fi
+          done
+          echo "=============================================================="
+
+      # ---------------------------------------------------------------------
+      # 步骤 8：集成 TurboAcc（适配 firewall4 的版本）
+      #   目的：ImmortalWrt 源码不含该插件，故从 chenmozhijin/turboacc 拉取
+      #         适配 firewall4 的版本。官方脚本会完成：
+      #           - 落位 package/turboacc（含 luci-app-turboacc 与 nft-fullcone）
+      #           - 用修补后的 firewall4 / libnftnl / nftables 替换源码自带版本
+      #           - 为当前内核版本打 conntrack 相关补丁（953/613 仅 SFE 模式需要）
+      #   策略：include_sfe=false（默认）时使用 --no-sfe，
+      #         作者明确说明 firewall4 自带软件流量分载、SFE 未充分验证。
+      # ---------------------------------------------------------------------
+      - name: 步骤 8 - 集成 TurboAcc（firewall4 适配版）
+        working-directory: immortalwrt
+        env:
+          INCLUDE_SFE: ${{ inputs.include_sfe }}
+        run: |
+          set -euo pipefail
+
+          # 内核版本前置校验：脚本只支持 5.10/5.15/6.1/6.6/6.12/6.18
+          KVER="$(sed -n 's/^KERNEL_PATCHVER:=\(.*\)$/\1/p' target/linux/x86/Makefile | tr -d ' \r')"
+          echo "当前源码内核补丁版本：${KVER}"
+          case "$KVER" in
+            5.10|5.15|6.1|6.6|6.12|6.18) ;;
+            *)
+              echo "==================== TurboAcc 集成前置校验失败 ===================="
+              echo "插件 / 组件   : TurboAcc"
+              echo "来源仓库      : ${{ env.TURBOACC_REPO }}"
+              echo "期望值        : 源码内核补丁版本属于 5.10/5.15/6.1/6.6/6.12/6.18"
+              echo "实际值        : ${KVER}"
+              echo "可能原因      : 上游分支内核版本升级，turboacc 尚未适配。"
+              echo "建议修复方向  : 确认 ${{ env.TURBOACC_REPO }} 是否已支持该内核，"
+              echo "                或改用其它分支；本工作流不会引入外部内核 kmod。"
+              echo "=================================================================="
+              echo "::error::TurboAcc 不支持内核 ${KVER}"
+              exit 1
+              ;;
+          esac
+
+          if ! curl -fsSL --retry 3 --retry-delay 5 \
+               "${{ env.TURBOACC_REPO }}" >/dev/null 2>&1; then
+            echo "::warning::TurboAcc 仓库可达性预检异常，继续尝试官方脚本"
+          fi
+
+          # 以官方脚本完成集成（脚本内部自行浅克隆 turboacc 与其 package 分支）
+          # 从 turboacc 仓库指定分支下载集成脚本；下载失败不在此处退出，
+          # 统一交给下方「空文件检测」输出可定位信息（缺失项 / 来源仓库 / 期望路径 / 可能原因）
+          curl -fsSL --retry 3 --retry-delay 5 -o /tmp/add_turboacc.sh \
+            "https://raw.githubusercontent.com/chenmozhijin/turboacc/${{ env.TURBOACC_BRANCH }}/add_turboacc.sh" \
+            2>/dev/null || true
+
+          if [ ! -s /tmp/add_turboacc.sh ]; then
+            echo "==================== TurboAcc 集成失败 ===================="
+            echo "插件 / 组件   : TurboAcc"
+            echo "失败阶段      : 拉取官方集成脚本"
+            echo "来源仓库      : ${{ env.TURBOACC_REPO }}（分支 ${{ env.TURBOACC_BRANCH }}）"
+            echo "期望路径      : add_turboacc.sh"
+            echo "实际检测结果  : 下载结果为空文件"
+            echo "可能原因      : 上游分支改名或脚本文件被移动。"
+            echo "建议修复方向  : 访问该仓库确认分支与文件名后，修改工作流顶部 TURBOACC_BRANCH。"
+            echo "========================================================="
+            echo "::error::无法获取 add_turboacc.sh"
+            exit 1
+          fi
+
+          EXTRA="--no-sfe"
+          if [ "${INCLUDE_SFE}" = "true" ]; then
+            EXTRA=""
+            echo "本次构建将包含 Shortcut-FE"
+          else
+            echo "本次构建不包含 Shortcut-FE（仅 软件流量分载 + 全锥型 NAT + BBR）"
+          fi
+          # shellcheck disable=SC2086
+          # 官方脚本在检测到 ./package/turboacc 已存在时会交互询问是否删除，
+          # 在 CI 环境会挂起等待输入；这里预先清理目录，保证非交互执行。
+          rm -rf package/turboacc
+          bash /tmp/add_turboacc.sh ${EXTRA}
+
+          # 校验 turboacc 落位结果
+          if [ ! -f package/turboacc/luci-app-turboacc/Makefile ]; then
+            echo "==================== TurboAcc 集成失败 ===================="
+            echo "插件 / 组件   : TurboAcc"
+            echo "失败阶段      : 落位校验"
+            echo "来源仓库      : ${{ env.TURBOACC_REPO }}"
+            echo "期望路径      : package/turboacc/luci-app-turboacc/Makefile"
+            echo "实际检测结果  : 文件不存在"
+            echo "可能原因      : 官方脚本执行中途失败（补丁冲突或替换 firewall4 时版本不匹配）。"
+            echo "建议修复方向  : 查看本步骤上方完整输出，定位脚本退出位置。"
+            echo "========================================================="
+            echo "::error::TurboAcc 未正确落位"
+            exit 1
+          fi
+          echo "TurboAcc 落位成功：package/turboacc"
+          ls -1 package/turboacc
+
+          # 官方脚本会先删除再拷回 libnftnl / firewall4 / nftables，
+          # 若版本目录匹配失败，这三个源码包可能被删空，这里做二次确认。
+          for comp in package/libs/libnftnl/Makefile \
+                      package/network/config/firewall4/Makefile \
+                      package/network/utils/nftables/Makefile; do
+            if [ ! -f "$comp" ]; then
+              echo "==================== TurboAcc 集成失败 ===================="
+              echo "插件 / 组件   : TurboAcc（防火墙组件替换）"
+              echo "失败阶段      : 组件替换校验"
+              echo "来源仓库      : ${{ env.TURBOACC_REPO }}（分支 package）"
+              echo "期望路径      : ${comp} 存在"
+              echo "实际检测结果  : 文件不存在（被删除后未成功拷回）"
+              echo "可能原因      : turboacc 的 package 分支中没有与当前源码匹配的版本目录，"
+              echo "                且 version 兜底也失败。"
+              echo "建议修复方向  : 对比 immortalwrt 源码与 turboacc@package 分支的"
+              echo "                libnftnl / firewall4 / nftables 版本号，"
+              echo "                必要时临时固定 TURBOACC_BRANCH 或等待上游更新。"
+              echo "========================================================="
+              echo "::error::TurboAcc 防火墙组件替换不完整：${comp}"
+              exit 1
+            fi
+          done
+          echo "libnftnl / firewall4 / nftables 替换校验通过"
+
+      # ---------------------------------------------------------------------
+      # 步骤 9：预置插件核心二进制
+      #   目的：满足“完整打包程序核心”的要求。
+      #         - AdGuardHome：放入 files/ 覆盖层，随固件打包到 /usr/bin/AdGuardHome，
+      #           LuCI 应用检测到该文件后无需联网下载即可启动。
+      #         - OpenClash：放入包目录 root/etc/openclash/core/，随 ipk 一起安装。
+      #   注意：两个核心都与当前固件同为 x86_64，来源为官方发布页。
+      # ---------------------------------------------------------------------
+      - name: 步骤 9 - 预置 AdGuardHome 与 OpenClash 核心二进制
+        run: |
+          set -euo pipefail
+          IW="$(pwd)/${{ env.SRC_DIR }}"
+          TMP="$(mktemp -d)"
+
+          # ---- 9.1 AdGuardHome 核心 ----
+          ADG_URL="https://github.com/AdguardTeam/AdGuardHome/releases/download/v${{ env.ADGUARD_VERSION }}/AdGuardHome_linux_amd64.tar.gz"
+          echo "下载 AdGuardHome 核心：${ADG_URL}"
+          curl -fL --retry 3 --retry-delay 5 -o "$TMP/adguard.tar.gz" "$ADG_URL"
+          tar -xzf "$TMP/adguard.tar.gz" -C "$TMP"
+          ADG_SRC="$(find "$TMP" -maxdepth 2 -type f -name AdGuardHome | head -1)"
+          if [ -z "$ADG_SRC" ]; then
+            echo "==================== AdGuardHome 核心预置失败 ===================="
+            echo "缺失项       : AdGuardHome 可执行文件"
+            echo "来源仓库     : https://github.com/AdguardTeam/AdGuardHome"
+            echo "期望路径     : 解压后存在 AdGuardHome/AdGuardHome"
+            echo "实际检测结果 : 解压目录中未找到 AdGuardHome 可执行文件"
+            echo "可能原因     : 版本号 ${ADGUARD_VERSION} 的发布资产命名变更或已下架。"
+            echo "建议修复方向 : 修改工作流顶部 ADGUARD_VERSION 为有效版本号。"
+            echo "================================================================"
+            echo "::error::AdGuardHome 核心解压后找不到可执行文件"
+            exit 1
+          fi
+          mkdir -p "$IW/files/usr/bin"
+          install -m 0755 "$ADG_SRC" "$IW/files/usr/bin/AdGuardHome"
+          echo "AdGuardHome 核心已预置：$IW/files/usr/bin/AdGuardHome ($(stat -c '%s' "$IW/files/usr/bin/AdGuardHome") 字节)"
+          "$IW/files/usr/bin/AdGuardHome" --version || true
+
+          # ---- 9.2 OpenClash 核心（Meta/mihomo，x86_64） ----
+          CLASH_URL="https://raw.githubusercontent.com/vernesong/OpenClash/core/master/meta/clash-linux-amd64.tar.gz"
+          echo "下载 OpenClash 核心：${CLASH_URL}"
+          curl -fL --retry 3 --retry-delay 5 -o "$TMP/clash.tar.gz" "$CLASH_URL"
+          mkdir -p "$TMP/clash"
+          tar -xzf "$TMP/clash.tar.gz" -C "$TMP/clash"
+          CLASH_SRC="$(find "$TMP/clash" -maxdepth 2 -type f | head -1)"
+          if [ -z "$CLASH_SRC" ]; then
+            echo "==================== OpenClash 核心预置失败 ===================="
+            echo "缺失项       : OpenClash 内核可执行文件"
+            echo "来源仓库     : https://github.com/vernesong/OpenClash （core 分支 meta 目录）"
+            echo "期望路径     : meta/clash-linux-amd64.tar.gz 解压后有可执行文件"
+            echo "实际检测结果 : 解压目录为空"
+            echo "可能原因     : 上游 core 分支目录结构变更。"
+            echo "建议修复方向 : 确认 core 分支下 meta/ 目录的资产名，修改本步骤 CLASH_URL。"
+            echo "==============================================================="
+            echo "::error::OpenClash 核心解压后找不到可执行文件"
+            exit 1
+          fi
+          OC_CORE_DIR="$IW/package/luci-app-openclash/root/etc/openclash/core"
+          mkdir -p "$OC_CORE_DIR"
+          install -m 0755 "$CLASH_SRC" "$OC_CORE_DIR/clash_meta"
+          echo "OpenClash 核心已预置：$OC_CORE_DIR/clash_meta ($(stat -c '%s' "$OC_CORE_DIR/clash_meta") 字节)"
+
+      # ---------------------------------------------------------------------
+      # 步骤 10：应用固件定制
+      #   目的：把需求中要求的内置项写进源码，避免只在运行时用脚本修补：
+      #         - 时区固定 Asia/Shanghai（CST-8），NTP 换为国内可达地址
+      #         - 默认 LAN 地址 192.168.2.1
+      #         - root 默认密码 12345678（写入 /etc/shadow，首次启动即生效）
+      #         - argon 主题设为系统默认主题
+      #         - 追加 files/ 覆盖层作为二次兜底
+      # ---------------------------------------------------------------------
+      - name: 步骤 10 - 应用固件定制（时区/默认IP/默认密码/默认主题）
+        env:
+          LAN_IP: ${{ env.LAN_IP }}
+          ROOT_PASSWORD: ${{ env.ROOT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          IW="$(pwd)/${{ env.SRC_DIR }}"
+          export LAN_IP ROOT_PASSWORD
+
+          # ---------- 10.1 时区 / NTP / 默认 LAN 地址 ----------
+          GEN="$IW/package/base-files/files/bin/config_generate"
+          if [ ! -f "$GEN" ]; then
+            echo "==================== 固件定制失败 ===================="
+            echo "定制项       : 默认时区 / 默认 LAN 地址"
+            echo "来源         : immortalwrt 源码"
+            echo "期望路径     : package/base-files/files/bin/config_generate"
+            echo "实际检测结果 : 文件不存在"
+            echo "可能原因     : 上游把默认配置生成逻辑迁移到了其它文件。"
+            echo "建议修复方向 : 在源码中检索 'timezone=' 定位新文件并同步修改本步骤。"
+            echo "====================================================="
+            echo "::error::未找到 config_generate，无法写入默认时区"
+            exit 1
+          fi
+
+          python3 - "$GEN" <<'PY'
+          import io
+          import os
+          import sys
+
+          path = sys.argv[1]
+          text = io.open(path, encoding="utf-8").read()
+          lan_ip = os.environ["LAN_IP"]
+
+          # 默认时区 UTC -> CST-8，并补充 zonename 供 LuCI 时区下拉框显示
+          text = text.replace(
+              "set system.@system[-1].timezone='UTC'",
+              "set system.@system[-1].timezone='CST-8'\n\t\tset system.@system[-1].zonename='Asia/Shanghai'",
+          )
+          # NTP 服务器替换为国内可达地址，保证首次开机即可同步时间
+          text = text.replace("time.apple.com", "ntp.aliyun.com")
+          text = text.replace("time1.google.com", "ntp1.aliyun.com")
+          text = text.replace("time.cloudflare.com", "time1.cloud.tencent.com")
+          text = text.replace("pool.ntp.org", "cn.pool.ntp.org")
+          # 默认 LAN 地址 192.168.1.1 -> 192.168.2.1
+          text = text.replace('lan) ipad=${ipaddr:-"192.168.1.1"}',
+                              'lan) ipad=${ipaddr:-"%s"}' % lan_ip)
+
+          io.open(path, "w", encoding="utf-8").write(text)
+          PY
+
+          # 校验替换是否真的生效
+          for check in "timezone='CST-8'" "zonename='Asia/Shanghai'" "192.168.2.1" "cn.pool.ntp.org"; do
+            if ! grep -qF "$check" "$GEN"; then
+              echo "==================== 固件定制失败 ===================="
+              echo "定制项       : $check"
+              echo "来源         : $GEN"
+              echo "检测命令     : grep -F \"$check\" $GEN"
+              echo "期望值       : 命中"
+              echo "实际值       : 未命中"
+              echo "可能原因     : 上游默认配置生成脚本内容变更，替换字符串不再匹配。"
+              echo "建议修复方向 : 打开该文件确认实际内容后，同步修改步骤 10 中的 python 替换逻辑。"
+              echo "====================================================="
+              echo "::error::定制项未生效：$check"
+              exit 1
+            fi
+          done
+          echo "默认时区 / NTP / LAN 地址定制完成"
+
+          # ---------- 10.2 root 默认密码 ----------
+          SHADOW="$IW/package/base-files/files/etc/shadow"
+          if [ -f "$SHADOW" ]; then
+            PW_HASH="$(openssl passwd -1 "$ROOT_PASSWORD")"
+            python3 - "$SHADOW" "$PW_HASH" <<'PY'
+          import io
+          import sys
+
+          path, pw_hash = sys.argv[1], sys.argv[2]
+          lines = io.open(path, encoding="utf-8").read().split("\n")
+          for idx, line in enumerate(lines):
+              if line.startswith("root:"):
+                  fields = line.split(":")
+                  fields[1] = pw_hash
+                  lines[idx] = ":".join(fields)
+                  break
+          io.open(path, "w", encoding="utf-8").write("\n".join(lines))
+          PY
+            echo "root 默认密码已写入 $SHADOW"
+          else
+            echo "::warning::未找到 $SHADOW，改为只依赖 files/uci-defaults 在首次启动时设置 root 密码"
+          fi
+
+          # ---------- 10.3 argon 设为默认主题 ----------
+          LIGHT_MK="$IW/feeds/luci/collections/luci-light/Makefile"
+          LUCI_CFG="$IW/feeds/luci/modules/luci-base/root/etc/config/luci"
+          if [ ! -f "$LIGHT_MK" ] || [ ! -f "$LUCI_CFG" ]; then
+            echo "==================== 默认主题定制失败 ===================="
+            echo "定制项       : argon 设为默认主题"
+            echo "期望路径     : $LIGHT_MK / $LUCI_CFG"
+            echo "实际检测结果 : 至少一个文件不存在"
+            echo "可能原因     : luci feed 目录结构变更。"
+            echo "建议修复方向 : 在 feeds/luci 中检索 luci-theme-bootstrap 与 luci-static/bootstrap 定位新位置。"
+            echo "=========================================================="
+            echo "::error::未找到 LuCI 主题相关文件"
+            exit 1
+          fi
+          # 把 luci-light 集合对 bootstrap 的依赖改写为 argon，保证 argon 随 luci 一起装上
+          sed -i 's/luci-theme-bootstrap/luci-theme-argon/g' "$LIGHT_MK"
+          # 把 LuCI 默认主题（mediaurlbase）从 bootstrap 改为 argon
+          sed -i 's#/luci-static/bootstrap#/luci-static/argon#g' "$LUCI_CFG"
+          grep -q 'luci-theme-argon' "$LIGHT_MK" || { echo "::error::luci-light 依赖改写失败"; exit 1; }
+          grep -q '/luci-static/argon' "$LUCI_CFG" || { echo "::error::默认主题改写失败"; exit 1; }
+          echo "argon 已设置为系统默认主题"
+
+          # ---------- 10.4 files/ 覆盖层（二次兜底 + 运行期保险） ----------
+          mkdir -p "$IW/files/etc/uci-defaults"
+          cat > "$IW/files/etc/uci-defaults/99-wrt-x64-defaults" <<UCI
+          #!/bin/sh
+          # 由 WRT-X64 云编译工作流写入的首次启动默认值（二次兜底，幂等）
+          uci -q set system.@system[0].timezone='CST-8'
+          uci -q set system.@system[0].zonename='Asia/Shanghai'
+          uci -q commit system
+          uci -q set network.lan.ipaddr='${LAN_IP}'
+          uci -q commit network
+          # AdGuardHome 核心位置显式指向随固件打包的二进制（luci-app-adguardhome 默认值即为此路径，
+          # 这里显式写一次是为了在上游默认值变更时仍能保证核心被找到）
+          uci -q get AdGuardHome.AdGuardHome >/dev/null 2>&1 && {
+            uci -q set AdGuardHome.AdGuardHome.binpath='/usr/bin/AdGuardHome'
+            uci -q commit AdGuardHome
+          }
+          # root 默认密码兜底设置
+          echo 'root:${ROOT_PASSWORD}' | chpasswd 2>/dev/null || \
+            printf '%s\n%s\n' '${ROOT_PASSWORD}' '${ROOT_PASSWORD}' | passwd root >/dev/null 2>&1
+          exit 0
+          UCI
+          chmod 0755 "$IW/files/etc/uci-defaults/99-wrt-x64-defaults"
+          echo "files/ 覆盖层写入完成："
+          find "$IW/files" -maxdepth 3 -type f -printf '  %p\n' | sort
+
+      # ---------------------------------------------------------------------
+      # 步骤 11：载入配置并解析依赖
+      #   目的：用仓库内置 config/X86_64.config 作为基线，
+      #         交给 make defconfig 自动补全依赖、剔除不可满足项。
+      #         若出现包冲突/依赖冲突，defconfig 会按“移除冲突项”处理，
+      #         随后由步骤 12 与产物校验共同兜底，绝不引入外部内核 kmod。
+      # ---------------------------------------------------------------------
+      - name: 步骤 11 - 载入 config/X86_64.config 并执行 defconfig
+        working-directory: immortalwrt
+        run: |
+          set -euo pipefail
+          cp -f "$GITHUB_WORKSPACE/config/X86_64.config" .config
+          # 兼容写法：CONFIG_XXX=n -> kconfig 标准写法 "# CONFIG_XXX is not set"
+          sed -i -E 's/^(CONFIG_[A-Za-z0-9_.+-]+)=n$/# \1 is not set/' .config
+
+          # 强制写入本次需求相关的关键项，防止被用户配置遗漏
+          for kv in \
+            CONFIG_TARGET_x86=y CONFIG_TARGET_x86_64=y CONFIG_TARGET_x86_64_Generic=y \
+            CONFIG_TARGET_ROOTFS_SQUASHFS=y CONFIG_TARGET_ROOTFS_PARTSIZE=2048 \
+            CONFIG_GRUB_IMAGES=y CONFIG_PACKAGE_luci-theme-argon=y
+          do
+            key="${kv%%=*}"; val="${kv##*=}"
+            if grep -q "^${key}=" .config; then
+              sed -i "s|^${key}=.*|${key}=${val}|" .config
+            else
+              echo "${key}=${val}" >> .config
+            fi
+          done
+          # 明确关闭 gzip / ext4，只保留 .img 产物
+          sed -i -E 's/^CONFIG_TARGET_IMAGES_GZIP=y$/# CONFIG_TARGET_IMAGES_GZIP is not set/' .config
+          grep -qE '^# CONFIG_TARGET_IMAGES_GZIP is not set$' .config || echo '# CONFIG_TARGET_IMAGES_GZIP is not set' >> .config
+          sed -i -E 's/^CONFIG_TARGET_ROOTFS_EXT4FS=y$/# CONFIG_TARGET_ROOTFS_EXT4FS is not set/' .config
+
+          echo "defconfig 前关键项："
+          grep -E '^(CONFIG_TARGET_ROOTFS_PARTSIZE|CONFIG_TARGET_IMAGES_GZIP|CONFIG_PACKAGE_luci-theme-argon)=' .config || true
+
+          make defconfig
+
+          echo ""
+          echo "==================== defconfig 结果 ===================="
+          grep -E '^CONFIG_TARGET_(x86|ROOTFS_PARTSIZE|KERNEL_PARTSIZE)|^CONFIG_TARGET_IMAGES_GZIP|^CONFIG_PACKAGE_luci-theme-argon=|^CONFIG_GRUB' .config || true
+          echo "======================================================"
+
+      # ---------------------------------------------------------------------
+      # 步骤 12：校验必选包是否全部成功解析
+      #   目的：defconfig 会静默剔除依赖不可满足的包。这一步在编译前就发现
+      #         “插件缺失/依赖缺失/kmod 冲突”，避免编译几小时才发现问题。
+      # ---------------------------------------------------------------------
+      - name: 步骤 12 - 校验必选软件包（编译前，依赖可达性）
+        working-directory: immortalwrt
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/scripts/check-packages.sh" config .config \
+            "$GITHUB_WORKSPACE/config/required-packages.txt"
+
+      # ---------------------------------------------------------------------
+      # 步骤 13：缓存 dl 目录
+      #   目的：缓存已下载的源码包与依赖，减少重复下载，缩短后续编译耗时。
+      # ---------------------------------------------------------------------
+      - name: 步骤 13 - 缓存 dl 下载目录（减少重复下载）
+        uses: actions/cache@v4
+        with:
+          path: immortalwrt/dl
+          key: dl-${{ env.SOURCE_BRANCH }}-${{ hashFiles('config/X86_64.config') }}
+          restore-keys: |
+            dl-${{ env.SOURCE_BRANCH }}-
+
+      # ---------------------------------------------------------------------
+      # 步骤 14：预下载所有源码包
+      #   目的：先把 dl 目录补齐，避免编译过程中因网络抖动中断；
+      #         同时把下载失败（缺失源码、路径错误）暴露在编译之前。
+      # ---------------------------------------------------------------------
+      - name: 步骤 14 - 预下载源码包（make download）
+        working-directory: immortalwrt
+        run: |
+          set -euo pipefail
+          make download -j"$(nproc)" || {
+            echo "::warning::并行下载存在失败项，改用串行重试以便暴露具体缺失项"
+            make download -j1 V=s
+          }
+
+          # 空文件通常代表上游 404 / 镜像返回错误页，这里直接判定为拉取失败
+          EMPTY_FILES="$(find dl -type f -empty 2>/dev/null | head -50 || true)"
+          if [ -n "$EMPTY_FILES" ]; then
+            echo "==================== 源码包下载校验失败 ===================="
+            echo "缺失项       : 出现 0 字节的下载文件（上游 404 或错误页）"
+            echo "来源仓库     : 由各软件包 Makefile 的 PKG_SOURCE_URL 决定"
+            echo "期望路径     : immortalwrt/dl/"
+            echo "检测命令     : find dl -type f -empty"
+            echo "实际检测结果 :"
+            echo "$EMPTY_FILES"
+            echo "可能原因     : 上游仓库分支/标签变更导致下载地址失效。"
+            echo "建议修复方向 : 按上列文件名定位对应包的 Makefile，核对 PKG_SOURCE_URL 与 PKG_HASH。"
+            echo "==========================================================="
+            echo "::error::dl 目录存在 0 字节下载文件，拉取失败"
+            exit 1
+          fi
+          echo "dl 目录大小：$(du -sh dl | cut -f1)"
+
+      # ---------------------------------------------------------------------
+      # 步骤 15：编译固件（严格模式）
+      #   目的：正式编译镜像。
+      #   严格模式说明：
+      #     - 不传 -k，make 遇到第一个错误即退出，不会继续编译其余软件包；
+      #     - 显式覆盖 IGNORE_ERRORS= 为空，杜绝“忽略错误继续编”的行为；
+      #     - 全程 tee 到 build.log，便于失败时上传完整日志。
+      # ---------------------------------------------------------------------
+      - name: 步骤 15 - 编译固件（严格模式，任一包失败立即终止）
+        working-directory: immortalwrt
+        run: |
+          set -o pipefail
+          echo "开始编译：$(date '+%F %T')，并行度 $(nproc)"
+          make -j"$(nproc)" IGNORE_ERRORS= 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          echo "编译结束：$(date '+%F %T')"
+
+      # ---------------------------------------------------------------------
+      # 步骤 16：编译失败时串行重跑以定位错误
+      #   目的：并行编译的报错信息会交错，难以定位。失败后以 -j1 V=s 重新执行，
+      #         输出真正出错的软件包与完整编译命令，追加写入同一份 build.log。
+      #   说明：该步骤一定不会让工作流“变成成功”，仅用于补充日志。
+      # ---------------------------------------------------------------------
+      - name: 步骤 16 - 编译失败时串行重跑以定位错误
+        if: failure()
+        continue-on-error: true
+        working-directory: immortalwrt
+        run: |
+          set -o pipefail
+          echo "==================== 进入失败复现（-j1 V=s） ===================="
+          make -j1 V=s IGNORE_ERRORS= 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log" || true
+          echo "==================== 失败复现结束 ==============================="
+
+      # ---------------------------------------------------------------------
+      # 步骤 17：校验编译产物
+      #   目的：按需求逐项确认产物正确：
+      #         - 文件存在性与命名：*-squashfs-combined.img
+      #         - 镜像格式：rootfs 分区起始为 squashfs 魔数 hsqs
+      #         - 分区信息：rootfs 分区已扩增至 2048 MiB（2G overlay 可写空间）
+      #         - 插件完整性：必选包全部出现在固件 manifest 中
+      #   任一项不通过即终止工作流，并输出检测命令/期望值/实际值/可能原因。
+      # ---------------------------------------------------------------------
+      - name: 步骤 17 - 校验编译产物（存在性/命名/格式/分区/插件完整性）
+        id: verify
+        run: |
+          set -o pipefail
+          OUTPUT="$(bash "$GITHUB_WORKSPACE/scripts/verify-artifacts.sh" \
+                      "${{ env.SRC_DIR }}/bin/targets/x86/64" \
+                      "${{ env.SRC_DIR }}" \
+                      "$GITHUB_WORKSPACE" | tee "$GITHUB_WORKSPACE/verify.log")"
+          IMAGE_PATH="$(printf '%s\n' "$OUTPUT" | sed -n 's/^IMAGE_PATH=//p' | tail -1)"
+          IMAGE_NAME="$(printf '%s\n' "$OUTPUT" | sed -n 's/^IMAGE_NAME=//p' | tail -1)"
+          echo "已确认产物：${IMAGE_NAME} -> ${IMAGE_PATH}"
+          echo "image_path=${IMAGE_PATH}" >> "$GITHUB_OUTPUT"
+          echo "image_name=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------------
+      # 步骤 18：上传固件 Artifact
+      #   目的：便于在 Actions 页面直接下载固件（可选，不影响 Release 内容）。
+      # ---------------------------------------------------------------------
+      - name: 步骤 18 - 上传固件 Artifact
+        if: success() && inputs.upload_artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-x86_64-squashfs-combined
+          path: ${{ steps.verify.outputs.image_path }}
+          if-no-files-found: error
+
+      # ---------------------------------------------------------------------
+      # 步骤 19：编译失败时上传完整日志
+      #   目的：需求要求编译失败必须上传完整日志用于排查错误与 Bug。
+      #         同时上传校验日志（若有），便于确认是编译失败还是产物校验失败。
+      # ---------------------------------------------------------------------
+      - name: 步骤 19 - 编译失败时上传完整编译日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_number }}
+          path: |
+            build.log
+            verify.log
+          if-no-files-found: ignore
+
+      # ---------------------------------------------------------------------
+      # 步骤 20：生成 Release 说明
+      #   目的：自动填充后台登录 IP / 账号 / 密码 / 内核版本 / 固件版本 /
+      #         已安装插件清单（仅应用插件，不含 kmod 内核模块驱动）。
+      # ---------------------------------------------------------------------
+      - name: 步骤 20 - 生成 Release 说明（固件信息与插件清单）
+        if: success()
+        id: notes
+        env:
+          IMAGE_NAME: ${{ steps.verify.outputs.image_name }}
+          LAN_IP: ${{ env.LAN_IP }}
+          ROOT_PASSWORD: ${{ env.ROOT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          TAG="X86_64-$(date -u '+%Y%m%d-%H%M')-r${{ github.run_number }}"
+          echo "release_tag=${TAG}" >> "$GITHUB_OUTPUT"
+          bash "$GITHUB_WORKSPACE/scripts/gen-release-notes.sh" \
+            "${{ env.SRC_DIR }}/bin/targets/x86/64" \
+            "${{ env.SRC_DIR }}" \
+            "$GITHUB_WORKSPACE/RELEASE_NOTES.md" \
+            "${IMAGE_NAME}" \
+            "${TAG}" \
+            "${{ github.repository }}" \
+            "$(cat "$GITHUB_WORKSPACE/.immortalwrt-sha" 2>/dev/null || echo unknown)"
+          echo "---------- Release 说明预览 ----------"
+          cat "$GITHUB_WORKSPACE/RELEASE_NOTES.md"
+
+      # ---------------------------------------------------------------------
+      # 步骤 21：创建 GitHub Release
+      #   目的：编译成功后自动发布固件。
+      #         仅上传 squashfs-combined.img，过滤其它多余产物（如 combined-efi.img、
+      #         manifest、profiles.json、sha256sums 等均不发布）。
+      # ---------------------------------------------------------------------
+      - name: 步骤 21 - 创建 GitHub Release（仅发布 squashfs-combined.img）
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_PATH: ${{ steps.verify.outputs.image_path }}
+          IMAGE_NAME: ${{ steps.verify.outputs.image_name }}
+          TAG: ${{ steps.notes.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "$IMAGE_PATH" ]; then
+            echo "==================== 发布前置校验失败 ===================="
+            echo "缺失项       : squashfs-combined.img"
+            echo "产物目录     : ${{ env.SRC_DIR }}/bin/targets/x86/64"
+            echo "期望路径     : ${IMAGE_PATH}"
+            echo "实际检测结果 : 文件不存在"
+            echo "可能原因     : 产物在校验之后被移动或删除。"
+            echo "========================================================="
+            echo "::error::待发布的固件不存在：${IMAGE_PATH}"
+            exit 1
+          fi
+
+          echo "发布对象：$IMAGE_NAME"
+          echo "Tag     ：$TAG"
+
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "ImmortalWrt X86_64 固件 ${TAG}" \
+            --notes-file "$GITHUB_WORKSPACE/RELEASE_NOTES.md" \
+            --latest \
+            "$IMAGE_PATH"
+
+          echo "Release 创建完成：${{ github.server_url }}/${{ github.repository }}/releases/tag/${TAG}"
