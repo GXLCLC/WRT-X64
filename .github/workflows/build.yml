@@ -1,0 +1,787 @@
+# ================================================================
+# .github/workflows/build.yml
+#
+#   ImmortalWrt X86_64 固件云编译工作流
+#
+# 【一句话说明】
+#   在本仓库点一下 Run workflow，云端自动完成：
+#     克隆源码 → 拉第三方插件 → 打编译兼容补丁 → 编译 → 扩容校准
+#     → 严格校验 → 压缩 → 生成 Release 说明 → 自动发布 Release
+#   全程零交互，不需要 SSH 登录编译机。
+#
+# 【维护只有三处，改动都别的地方不用动】
+#   · config/X86_64.config       —— 增减软件包、改分区大小
+#   · scripts/system-config.sh   —— 改 LAN IP / 密码 / 主机名 / 时区 / 主题
+#   · scripts/feeds_update.sh    —— 增删第三方插件来源仓库
+#   （插件编译兼容问题统一改 scripts/patch-plugins.sh）
+#
+# 【严格原则：绝不产出「看起来成功、实际缺件」的固件】
+#   1. feeds / 第三方拉取失败            → 立即终止
+#   2. 插件编译兼容补丁打不上            → 立即终止
+#   3. make defconfig 后关键开关被静默丢弃 → 立即终止
+#   4. 任何软件包编译失败（未加 -i / IGNORE_ERRORS）→ 立即终止
+#   5. 编译产物与配置对不上（少插件/少镜像）→ 立即终止
+#   任一条不满足，都不会走到发布环节；失败时自动打包上传完整日志，
+#   并在日志里明确指出「是哪个包 / 来自哪个仓库 / 该去哪里改」。
+# ================================================================
+
+name: ImmortalWrt X86_64 云编译
+
+# ----------------------------------------------------------------
+# 触发方式
+#   workflow_dispatch —— 手动触发（主入口，Actions 页面点 Run workflow）
+#   push              —— 仅当改动了编译配置 / 定制文件 / 脚本 / 本工作流时
+#                        自动触发一次，避免改了配置却忘记手动跑
+# ----------------------------------------------------------------
+on:
+  workflow_dispatch:
+    inputs:
+      agh_version:
+        description: 'AdGuardHome 指定版本（留空 = 自动探测与内置 Go 兼容的最新稳定版）'
+        required: false
+        default: ''
+  push:
+    paths:
+      - 'config/**'
+      - 'files/**'
+      - 'scripts/**'
+      - '.github/workflows/build.yml'
+
+# ----------------------------------------------------------------
+# 权限：创建 Release 需要写权限
+#   （历史上不加这一项会直接 403，Release 建不出来）
+# ----------------------------------------------------------------
+permissions:
+  contents: write
+
+# ----------------------------------------------------------------
+# 并发控制：同一分支同一时刻只允许一个编译任务，
+# 但不取消已在跑的任务（编译动辄两三个小时，被中途掐掉太浪费）
+# ----------------------------------------------------------------
+concurrency:
+  group: build-x86-64-${{ github.ref }}
+  cancel-in-progress: false
+
+# ----------------------------------------------------------------
+# 全局环境变量（所有步骤共用）
+# ----------------------------------------------------------------
+env:
+  TZ: Asia/Shanghai
+  # 上游源码仓库与分支
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: openwrt-24.10
+  # 源码在工作区内的目录名
+  SRC_DIR: immortalwrt
+  # 仓库内的编译配置文件
+  CONFIG_FILE: config/X86_64.config
+  # 编译产物目录（x86/64 子目标）
+  BIN_DIR: immortalwrt/bin/targets/x86/64
+  # 完整编译日志（失败时上传）
+  BUILD_LOGFILE: ${{ github.workspace }}/build.log
+  # ccache 体积上限与压缩，避免把 GitHub 的 10GB 缓存配额吃掉
+  CCACHE_MAXSIZE: 4G
+  CCACHE_COMPRESS: 'true'
+  # 去掉 Go/Rust 等工具链可能产生的多余下载提示
+  CI: 'true'
+
+jobs:
+  build:
+    name: 编译 X86_64 固件
+    # ----------------------------------------------------------------
+    # 编译环境：GitHub 官方 Ubuntu 24.04 LTS Runner（x86_64）
+    #   24.04 的 Python 已升级到 3.12，python3-distutils 包被移除，
+    #   因此下面的依赖安装步骤会「逐个探测可用性、缺失自动跳过」，
+    #   避免 apt 因一个不存在的包整体失败（见步骤 4）
+    # ----------------------------------------------------------------
+    runs-on: ubuntu-24.04
+    # GitHub 单个任务上限 6 小时，留 5 分钟余量给收尾步骤
+    timeout-minutes: 355
+
+    steps:
+      # ============================================================
+      # 【1】检出本仓库代码
+      #   只取当前提交，历史对编译没用，浅检出更快
+      # ============================================================
+      - name: 【1】检出本仓库代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # ============================================================
+      # 【2】打印构建环境信息
+      #   出问题时第一眼就能看到「在哪台机器、什么内核、多少核、
+      #   多少磁盘」，省去反复问「你的环境是什么」
+      # ============================================================
+      - name: 【2】打印构建环境信息
+        run: |
+          set -euo pipefail
+          echo "==> 系统版本"
+          lsb_release -a || cat /etc/os-release
+          echo "==> 内核版本"
+          uname -a
+          echo "==> CPU 核心数"
+          nproc
+          echo "==> 内存"
+          free -h
+          echo "==> 磁盘（清理前）"
+          df -h /
+
+      # ============================================================
+      # 【3】释放 Runner 磁盘空间
+      #   GitHub 免费 Runner 的系统盘默认只剩十几 GB，
+      #   而一次 X86_64 编译（build_dir + 多个 2.5GB 镜像）需要
+      #   40GB 以上。这里删掉镜像里预装、但编译 OpenWrt 完全用不到
+      #   的大体积组件（Android SDK / .NET / GHC / CodeQL 等）。
+      #   加了环境判断：非 GitHub Actions 环境绝不执行删除。
+      # ============================================================
+      - name: 【3】释放 Runner 磁盘空间
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_ACTIONS:-}" != "true" ]; then
+            echo "当前不是 GitHub Actions 环境，跳过磁盘清理"
+            exit 0
+          fi
+          echo "==> 正在清理预装 SDK（这些与 OpenWrt 编译无关）"
+          for p in \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost \
+            /usr/local/lib/node_modules \
+            /usr/share/swift \
+            /usr/share/miniconda \
+            /usr/local/share/powershell \
+            /usr/local/share/chromium \
+            /opt/az \
+            /opt/microsoft \
+            /usr/lib/jvm \
+            /opt/google/chrome ; do
+            if [ -e "$p" ]; then
+              echo "    删除 $p"
+              sudo rm -rf "$p"
+            fi
+          done
+          # Docker 预装镜像（Runner 上默认没有容器在跑）
+          sudo docker image prune -a -f >/dev/null 2>&1 || true
+          # apt 缓存
+          sudo apt-get clean
+          echo "==> 清理后的磁盘占用"
+          df -h /
+
+      # ============================================================
+      # 【4】安装 ImmortalWrt 编译依赖
+      #   包清单来自 OpenWrt 官方文档的「Ubuntu 24.04（Python 3.12）」
+      #   一节，另补上本仓库真正会用到的几个：
+      #     ccache       —— .config 里开了 CONFIG_CCACHE，缓存跨次复用
+      #     pigz         —— 多线程压缩镜像，比单线程 gzip 快数倍
+      #     swig/libelf-dev —— 部分内核与工具包需要
+      #     python3-dev  —— 少数 host 侧 Python 扩展编译需要 pyconfig.h
+      #
+      #   【为什么不能一把梭 apt-get install】
+      #   Ubuntu 各版本对依赖包的增删不同（例如 24.04 移除了
+      #   python3-distutils、26.04 起 libncurses5-dev 改名为
+      #   libncurses-dev）。这里逐个探测可用性，缺失的打印出来并
+      #   跳过，保证 Runner 换版本时这一步不会整个失败。
+      # ============================================================
+      - name: 【4】安装 ImmortalWrt 编译依赖
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+
+          # OpenWrt 官方文档的 Ubuntu 24.04 基础清单 + 本仓库补充项
+          PKG_LIST="build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git \
+            libncurses5-dev libncursesw5-dev libssl-dev \
+            python3 python3-dev python3-setuptools \
+            rsync unzip zlib1g-dev file wget curl \
+            ccache swig libelf-dev patch time pigz cmake"
+
+          # 逐个探测：apt-cache show 能查到才安装，查不到就跳过
+          AVAILABLE=""
+          for p in $PKG_LIST; do
+            if apt-cache show "$p" >/dev/null 2>&1; then
+              AVAILABLE="$AVAILABLE $p"
+            else
+              echo "==> 跳过当前 Runner 不提供的包: $p"
+            fi
+          done
+          [ -n "${AVAILABLE// /}" ] || { echo "错误: 一个依赖包都不可用，apt 源异常"; exit 1; }
+
+          echo "==> 准备安装:$AVAILABLE"
+          sudo apt-get install -y -qq $AVAILABLE
+
+          echo "==> 依赖安装完成，版本抽查："
+          for c in gcc g++ make ccache pigz python3 swig; do
+            printf '    %-8s %s\n' "$c" "$(command -v "$c" >/dev/null 2>&1 && "$c" --version 2>&1 | head -n1 || echo '缺失')"
+          done
+          # Ubuntu 24.04 起 Python 3.12 移除了 distutils 标准库，
+          # 少数 host 构建脚本会 import distutils；python3-setuptools
+          # 自带 distutils 兼容层（distutils-precedence.pth），这里
+          # 显式验证一次，缺失仅打印提示、不阻断编译
+          python3 -c "import setuptools, distutils" 2>/dev/null \
+            && echo "    python3 distutils 兼容层正常" \
+            || echo "    (提示) 当前无 distutils 兼容层，仅影响极少数 host 包，继续编译"
+
+      # ============================================================
+      # 【5】缓存 dl 源码包目录
+      #   dl/ 存放所有软件包源码压缩包，体积 2GB 上下。
+      #   缓存后重复编译不必重新下载，直接进入编译阶段。
+      #   key 里带 run_id：每次运行都会把「本次新增的源码包」存回缓存，
+      #   restore-keys 前缀匹配则保证总能恢复到最近一份可用的缓存。
+      # ============================================================
+      - name: 【5】缓存 dl 源码包目录
+        uses: actions/cache@v4
+        with:
+          path: immortalwrt/dl
+          key: dl-${{ runner.os }}-${{ hashFiles('config/X86_64.config') }}-${{ github.run_id }}
+          restore-keys: |
+            dl-${{ runner.os }}-${{ hashFiles('config/X86_64.config') }}-
+            dl-${{ runner.os }}-
+
+      # ============================================================
+      # 【6】缓存 ccache 编译缓存
+      #   x86 目标直接用宿主机 gcc 编译，ccache 命中率很高，
+      #   第二次之后的编译能省下大量时间。
+      # ============================================================
+      - name: 【6】缓存 ccache 编译缓存
+        uses: actions/cache@v4
+        with:
+          path: immortalwrt/.ccache
+          key: ccache-${{ runner.os }}-${{ hashFiles('config/X86_64.config') }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ hashFiles('config/X86_64.config') }}-
+            ccache-${{ runner.os }}-
+
+      # ============================================================
+      # 【7】克隆 ImmortalWrt 源码
+      #   固定 openwrt-24.10 分支，浅克隆（不拉历史、不拉其它分支）
+      # ============================================================
+      - name: 【7】克隆 ImmortalWrt 源码（${{ env.REPO_BRANCH }}）
+        run: |
+          set -euo pipefail
+          echo "==> 克隆 $REPO_URL （分支 $REPO_BRANCH）"
+          git clone --depth 1 --single-branch --branch "$REPO_BRANCH" "$REPO_URL" "$SRC_DIR"
+          cd "$SRC_DIR"
+          echo "==> 源码 HEAD: $(git log -1 --format='%h %cd %s' --date=short)"
+          test -f rules.mk || { echo "错误: 克隆结果不完整（缺少 rules.mk）"; exit 1; }
+
+      # ============================================================
+      # 【8】注入本仓库的编译配置与定制文件
+      #   A. config/X86_64.config  → 源码树 .config（增量配置）
+      #   B. files/                → 源码树 files/（会整体打包进固件）
+      #   C. scripts/*.sh          → 源码树 scripts/（与 ImmortalWrt
+      #      自带的 feeds / diffconfig 等脚本同名冲突为零，可放心放）
+      # ============================================================
+      - name: 【8】注入编译配置与定制文件
+        run: |
+          set -euo pipefail
+          echo "==> 拷贝编译配置: $CONFIG_FILE -> $SRC_DIR/.config"
+          cp -f "$CONFIG_FILE" "$SRC_DIR/.config"
+
+          echo "==> 拷贝定制文件 files/ -> $SRC_DIR/files/"
+          mkdir -p "$SRC_DIR/files"
+          cp -a files/. "$SRC_DIR/files/"
+
+          echo "==> 拷贝维护脚本 scripts/*.sh -> $SRC_DIR/scripts/"
+          mkdir -p "$SRC_DIR/scripts"
+          cp -f scripts/*.sh "$SRC_DIR/scripts/"
+          chmod 0755 "$SRC_DIR"/scripts/*.sh
+
+          # 首启脚本 / 服务脚本必须可执行（部分条目由 system-config.sh 生成）
+          find "$SRC_DIR/files" -type f \
+            \( -path '*/uci-defaults/*' -o -path '*/init.d/*' -o -path '*/sbin/*' \) \
+            -exec chmod 0755 {} +
+
+          echo "==> 注入结果："
+          echo "    配置文件行数: $(wc -l < "$SRC_DIR/.config")"
+          echo "    files/ 文件数: $(find "$SRC_DIR/files" -type f | wc -l)"
+          echo "    scripts/ 脚本: $(cd "$SRC_DIR/scripts" && ls -1 *.sh | tr '\n' ' ')"
+
+      # ============================================================
+      # 【9】生成系统参数首启脚本
+      #   调用 scripts/system-config.sh —— 系统参数的唯一维护点。
+      #   由它生成 files/etc/uci-defaults/99-90-custom-settings，
+      #   负责首次启动时设置：主机名 / 时区 / NTP / LAN IP / DHCP 池 /
+      #   root 密码 / 默认主题。
+      #   工作流本身不写死任何一个系统参数，改参数只改那一个脚本。
+      # ============================================================
+      - name: 【9】生成系统参数首启脚本（system-config.sh）
+        run: |
+          set -euo pipefail
+          cd "$SRC_DIR"
+          bash scripts/system-config.sh .
+          test -f files/etc/uci-defaults/99-90-custom-settings \
+            || { echo "错误: 首启脚本未生成"; exit 1; }
+
+      # ============================================================
+      # 【10】更新 feeds 源并拉取第三方插件
+      #   调用 scripts/feeds_update.sh：
+      #     1. feeds update -a / feeds install -a（官方软件包源）
+      #     2. 按来源表浅克隆第三方插件到 package/thirdparty/
+      #        （源码自带优先，缺失才拉；OAF / TurboAcc / AdGuardHome
+      #         强制使用第三方版本）
+      #   任何一项拉取失败都会打印「缺失包名 / 来源仓库 / 指定分支 /
+      #   仓库内路径 / 处理建议」并立即终止。
+      # ============================================================
+      - name: 【10】更新 feeds 并拉取第三方插件（feeds_update.sh）
+        run: |
+          set -euo pipefail
+          cd "$SRC_DIR"
+          bash scripts/feeds_update.sh
+
+      # ============================================================
+      # 【11】应用插件编译兼容补丁
+      #   调用 scripts/patch-plugins.sh：
+      #     当前主要修复 kenzok8 版 AdGuardHome —— 它默认跟最新版，
+      #     go.mod 用到 Go 1.26 的 tool/ignore 新语法，而 ImmortalWrt
+      #     24.10 内置 Go 1.23.12 且 GOTOOLCHAIN=local（禁止下载新
+      #     工具链），必然编译失败。
+      #     脚本会自动把版本对齐到与内置 Go 兼容的最新稳定版、重算
+      #     哈希、并注入 go.mod 规范化钩子（双保险）。
+      #   以后遇到新的兼容坑，全部加到这一个脚本里，不用动本工作流。
+      # ============================================================
+      - name: 【11】应用插件编译兼容补丁（patch-plugins.sh）
+        env:
+          # 传入 token 把 GitHub API 限额从 60 次/时 提到 5000 次/时
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 留空即自动探测；需要锁定版本时在手动触发时填
+          ADGUARDHOME_VERSION: ${{ inputs.agh_version }}
+        run: |
+          set -euo pipefail
+          cd "$SRC_DIR"
+          bash scripts/patch-plugins.sh .
+
+      # ============================================================
+      # 【12】生成完整 .config
+      #   config/X86_64.config 是「增量式」配置，这里用 make defconfig
+      #   补全全部隐含依赖，得到真正参与编译的完整 .config。
+      # ============================================================
+      - name: 【12】生成完整 .config（make defconfig）
+        run: |
+          set -euo pipefail
+          cd "$SRC_DIR"
+          make defconfig 2>&1 | tee -a "$BUILD_LOGFILE"
+
+      # ============================================================
+      # 【13】复核关键构建开关（防止被静默丢弃）
+      #   这是本工作流最关键的一道保险：
+      #   `make defconfig` 对「写进 .config 但不存在（或依赖不满足）的
+      #   配置项」是静默丢弃的 —— 不报错、不警告。软件包层面由
+      #   verify-packages.sh 兜底；但 TARGET_x86_64、GRUB_EFI_IMAGES、
+      #   分区大小、中文语言总开关这类「构建系统开关」不属于软件包，
+      #   必须在这里单独查，否则会编出「架构不对 / 只有 BIOS 镜像 /
+      #   overlay 只有几百兆 / 界面全是英文」的固件却一路绿到底。
+      # ============================================================
+      - name: 【13】复核关键构建开关未被静默丢弃
+        run: |
+          set -euo pipefail
+          cd "$SRC_DIR"
+
+          fail=0
+          check() {
+            # $1 = 期望在 .config 中逐字出现的整行   $2 = 中文说明
+            if grep -qxF "$1" .config; then
+              printf '    [OK]   %s\n' "$2"
+            else
+              printf '    [丢失] %s   —— 期望内容：%s\n' "$2" "$1"
+              fail=1
+            fi
+          }
+
+          echo "==> 复核构建系统开关（这些不是软件包，verify-packages.sh 查不到）"
+          check 'CONFIG_TARGET_x86=y'                    '目标架构 x86'
+          check 'CONFIG_TARGET_x86_64=y'                  '子目标 x86_64（仅 64 位）'
+          check 'CONFIG_TARGET_x86_64_DEVICE_generic=y'   '设备 generic'
+          check 'CONFIG_TARGET_ROOTFS_SQUASHFS=y'         '根文件系统 squashfs'
+          check 'CONFIG_GRUB_IMAGES=y'                    'BIOS 引导镜像（GRUB）'
+          check 'CONFIG_GRUB_EFI_IMAGES=y'                'UEFI 引导镜像（GRUB-EFI）'
+          check 'CONFIG_TARGET_KERNEL_PARTSIZE=32'        '内核分区 32MB'
+          check 'CONFIG_TARGET_ROOTFS_PARTSIZE=2560'      '根分区 2560MB（保证 overlay ≥2GiB）'
+          check '# CONFIG_TARGET_IMAGES_GZIP is not set'  '关闭自动 gzip（必须扩容后再压缩）'
+          check 'CONFIG_LUCI_LANG_zh_Hans=y'             'LuCI 简体中文总开关'
+          check 'CONFIG_PACKAGE_luci=y'                  'LuCI 基础框架'
+          check 'CONFIG_CCACHE=y'                        'ccache 编译缓存'
+          check 'CONFIG_BUILD_LOG=y'                     '分包子编译日志（失败定位靠它）'
+
+          echo ""
+          echo "==> 复核被明确排除的镜像格式（一旦被打开会多出数 GB 无用产物）"
+          for sym in ISO_IMAGES QCOW2_IMAGES VDI_IMAGES VMDK_IMAGES VHDX_IMAGES TARGET_ROOTFS_EXT4FS; do
+            if grep -qx "CONFIG_${sym}=y" .config; then
+              printf '    [异常] CONFIG_%s 被意外启用\n' "$sym"
+              fail=1
+            else
+              printf '    [OK]   CONFIG_%s 已关闭\n' "$sym"
+            fi
+          done
+
+          # 留一份最终 .config 给失败诊断包
+          cp -f .config "$GITHUB_WORKSPACE/final.config"
+
+          if [ "$fail" -ne 0 ]; then
+            echo ""
+            echo "==================================================================="
+            echo "  复核失败：有构建系统开关被 make defconfig 静默丢弃"
+            echo "  说明该配置项在 openwrt-24.10 中不存在，或依赖条件不满足。"
+            echo "  请修正 config/X86_64.config 后重新触发，绝不带病编译。"
+            echo "==================================================================="
+            exit 1
+          fi
+          echo ""
+          echo "==> 复核通过：全部关键开关都已生效"
+
+      # ============================================================
+      # 【14】预下载全部源码包
+      #   先把 dl/ 下齐再编译，避免编译过程中因网络抖动中断；
+      #   下载完顺手校验一遍文件完整性（体积异常小的视为没下全，
+      #   删掉后用单线程详细模式重下一次）。
+      # ============================================================
+      - name: 【14】预下载源码包（make download）
+        run: |
+          set -euo pipefail
+          cd "$SRC_DIR"
+          echo "==> 并行下载（并行度 $(nproc)）"
+          make -j"$(nproc)" download 2>&1 | tee -a "$BUILD_LOGFILE"
+
+          mapfile -t bad < <(find dl -type f -size -1024c 2>/dev/null | sort)
+          if [ "${#bad[@]}" -gt 0 ]; then
+            echo "==> 发现 ${#bad[@]} 个体积异常的下载文件，将删除后重下："
+            printf '    %s\n' "${bad[@]}"
+            printf '%s\0' "${bad[@]}" | xargs -0 -r rm -f
+            echo "==> 单线程详细模式重新下载"
+            make -j1 V=s download 2>&1 | tee -a "$BUILD_LOGFILE"
+          fi
+          echo "==> dl 目录体积: $(du -sh dl | cut -f1)"
+
+      # ============================================================
+      # 【15】开始编译固件（严格模式）
+      #   关键点：绝对不加 -i、绝对不设 IGNORE_ERRORS。
+      #   只要任何一个软件包编译失败，make 立即以非 0 退出，
+      #   工作流当场终止，绝不产出「少插件但看起来成功」的固件。
+      #   CONFIG_BUILD_LOG=y 会让每个包各自输出一份编译日志到
+      #   logs/package/...，失败时下一步据此精确定位。
+      # ============================================================
+      - name: 【15】开始编译固件（严格模式，任何包失败即终止）
+        run: |
+          set -euo pipefail
+          cd "$SRC_DIR"
+          echo "==> 开始编译：make -j$(nproc)"
+          echo "    严格模式：未使用 -i / IGNORE_ERRORS，任何软件包失败都会立即终止"
+          make -j"$(nproc)" 2>&1 | tee -a "$BUILD_LOGFILE"
+
+      # ============================================================
+      # 【16】失败诊断：定位失败的包与它的来源仓库
+      #   并行编译的主日志是交错的，直接看 build.log 很难判断是哪个
+      #   包炸了。这里靠 CONFIG_BUILD_LOG 产生的
+      #   logs/package/<路径>/error.txt 精确列出失败包，并打印：
+      #     包名 / 本地源码路径 / 版本 / 下载来源 URL / 错误摘要 /
+      #     完整日志位置
+      #   同时把结论写进 Job Summary，方便一眼定位。
+      # ============================================================
+      - name: 【16】失败诊断：定位失败包与来源仓库
+        if: failure()
+        run: |
+          set +e
+          cd "$SRC_DIR" 2>/dev/null || exit 0
+          # 立刻固化绝对路径：本步骤后面既要引用源码树、也要引用工作区，
+          # 继续用相对的 $SRC_DIR 拼路径会变成 SRC_DIR/SRC_DIR/...（路径翻倍）
+          SRC_ABS="$(pwd)"
+
+          {
+            echo "## 编译失败诊断"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          mapfile -t err_files < <(find logs -type f -name error.txt 2>/dev/null | sort)
+
+          if [ "${#err_files[@]}" -gt 0 ]; then
+            echo "==================================================================="
+            echo "  失败的软件包共 ${#err_files[@]} 个（来自 logs/package/**/error.txt）"
+            echo "==================================================================="
+            for f in "${err_files[@]}"; do
+              rel="${f#logs/package/}"
+              rel="${rel%/error.txt}"
+              pkg="${rel##*/}"
+
+              # 定位这个包在源码树里的真实目录，并判断它是不是第三方来的
+              srcdir="$(find package/thirdparty -maxdepth 1 -type d -name "$pkg" -print -quit 2>/dev/null)"
+              origin="第三方（scripts/feeds_update.sh 拉取）"
+              if [ -z "$srcdir" ]; then
+                srcdir="$(find package/feeds -maxdepth 4 -type d -name "$pkg" -print -quit 2>/dev/null)"
+                origin="官方 feed"
+              fi
+              [ -n "$srcdir" ] || srcdir="package/$rel"
+
+              echo "-------------------------------------------------------------------"
+              echo "  失败包名    : $pkg"
+              echo "  本地源码路径: $srcdir"
+              echo "  包来源      : $origin"
+              if [ -f "$srcdir/Makefile" ]; then
+                echo "  包版本      : $(grep -m1 -hoE 'PKG_VERSION:?=.*' "$srcdir/Makefile" || echo '（未声明）')"
+                echo "  下载来源    :"
+                grep -hoE 'PKG_SOURCE_URL:?=.*' "$srcdir/Makefile" 2>/dev/null |
+                  head -n3 | sed 's/^/                /' || echo "                （未声明）"
+              fi
+              echo "  错误摘要    :"
+              sed -n '1,20p' "$f" | sed 's/^/                | /'
+              echo "  完整日志    : $f"
+              echo "  编译输出    : $(dirname "$f")/compile.txt"
+
+              {
+                echo "- **$pkg**（$origin）"
+                echo "  - 源码路径：\`$srcdir\`"
+                echo "  - 日志：\`$f\` / \`$(dirname "$f")/compile.txt\`"
+              } >> "$GITHUB_STEP_SUMMARY"
+            done
+          else
+            echo "==================================================================="
+            echo "  未找到 logs/package/**/error.txt，无法按包定位失败点"
+            echo "  （可能是 feeds 拉取 / 补丁阶段或更早的步骤失败，见下方日志尾部）"
+            echo "==================================================================="
+            echo "  · 若失败发生在 feeds 或补丁阶段，脚本自身已打印明确的"
+            echo "    「缺失项 / 来源仓库 / 指定分支 / 处理建议」，往上翻即可。"
+            echo "  · 下方是完整编译日志（$BUILD_LOGFILE）的最后 200 行："
+            echo "-------------------------------------------------------------------"
+            tail -n 200 "$BUILD_LOGFILE" 2>/dev/null || echo "（日志文件不存在）"
+            {
+              echo ""
+              echo "未能按包定位失败点；失败可能发生在 feeds 拉取 / 补丁阶段，"
+              echo "或编译阶段的主日志中。请查看附件中的 build.log 与日志包。"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo ""
+          echo "==> 另外检查是否存在没下载完整的源码包（体积 < 1KB）"
+          find dl -type f -size -1024c 2>/dev/null | sed 's/^/    /' || true
+
+          # 打包完整日志，供下一步上传
+          #   注意：tar 不能向已压缩的归档追加文件，所以先建未压缩包
+          #   （.tar），追加完再统一 gzip。
+          WS="$GITHUB_WORKSPACE"
+          rm -f "$WS/build-logs.tar" "$WS/build-logs.tar.gz"
+
+          ARGS=()
+          [ -f "$WS/build.log" ] && ARGS+=(-C "$WS" build.log)
+          [ -f "$WS/final.config" ] && ARGS+=(-C "$WS" final.config)
+          if [ "${#ARGS[@]}" -gt 0 ]; then
+            tar -cf "$WS/build-logs.tar" "${ARGS[@]}" 2>/dev/null || true
+          fi
+
+          # 追加：源码树内的分包日志、最终 .config、第三方插件（含已打过补丁的 Makefile）
+          #   一律用 SRC_ABS（绝对路径），不依赖“当前目录恰好是源码树”
+          for item in logs .config package/thirdparty; do
+            if [ -e "$SRC_ABS/$item" ]; then
+              tar -rf "$WS/build-logs.tar" -C "$SRC_ABS" "$item" 2>/dev/null || true
+            fi
+          done
+
+          if [ -f "$WS/build-logs.tar" ]; then
+            gzip -9 -f "$WS/build-logs.tar"
+            echo "==> 日志包已生成:"
+            ls -lh "$WS"/build-logs.tar.gz
+          else
+            echo "（未能生成日志包，将只上传 build.log）"
+          fi
+
+      # ============================================================
+      # 【17】失败时上传完整日志
+      #   需求要求「编译失败上传完整日志并立即终止」——
+      #   本步骤只在前面有步骤失败时执行；执行完工作流即结束
+      #   （后续步骤都带 success 隐含条件，不会继续跑）。
+      # ============================================================
+      - name: 【17】失败时上传完整编译日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-r${{ github.run_number }}
+          path: |
+            build.log
+            build-logs.tar.gz*
+            final.config
+          if-no-files-found: warn
+          retention-days: 14
+
+      # ============================================================
+      # 【18】固件后置处理：扩容 rootfs_data(/overlay)
+      #   squashfs combined 镜像出厂时 /overlay 很小，装几个包就满。
+      #   scripts/post-build.sh 直接对分区表做手术，把根分区尾部扩大，
+      #   使可写空间 ≥2048MiB（BIOS 的 MBR 与 UEFI 的 GPT 两种镜像
+      #   都会处理，包含备份 GPT 表重建与 fwtool 尾部元数据保护）。
+      # ============================================================
+      - name: 【18】扩容 rootfs_data(/overlay) 至 2GiB（post-build.sh）
+        run: |
+          set -euo pipefail
+          cd "$SRC_DIR"
+          shopt -s nullglob
+          imgs=(bin/targets/x86/64/*squashfs-combined.img \
+                bin/targets/x86/64/*squashfs-combined-efi.img)
+          if [ "${#imgs[@]}" -eq 0 ]; then
+            echo "错误: 未找到任何 squashfs combined 镜像，编译产物异常"
+            ls -lh bin/targets/x86/64/ || true
+            exit 1
+          fi
+          for img in "${imgs[@]}"; do
+            bash scripts/post-build.sh "$img" 2048
+          done
+          echo "==> 当前镜像文件："
+          ls -lh bin/targets/x86/64/*squashfs-combined*.img || true
+
+      # ============================================================
+      # 【19】严格校验编译产物
+      #   调用 scripts/verify-packages.sh：
+      #     1. config/X86_64.config 里声明的每一个 CONFIG_PACKAGE_xxx=y
+      #        都必须能在固件真实清单（*.manifest）里找到；
+      #     2. 关键组件硬清单（插件清单底线）一条都不能少；
+      #     3. BIOS + UEFI 两个 squashfs combined 镜像都必须存在。
+      #   少任何一项 → 立即失败，绝不放行到发布环节。
+      #   （必须在压缩之前跑：校验的是未压缩的 .img）
+      # ============================================================
+      - name: 【19】严格校验编译产物（verify-packages.sh）
+        run: |
+          set -euo pipefail
+          bash scripts/verify-packages.sh "$BIN_DIR" "$CONFIG_FILE"
+
+      # ============================================================
+      # 【20】压缩镜像
+      #   为什么压缩放到扩容之后：分区表手术处理的是原始 .img，
+      #   所以 .config 里刻意关掉了 CONFIG_TARGET_IMAGES_GZIP。
+      #   这里用 pigz 多线程压缩，压缩后清掉所有未压缩的 .img
+      #   （含 padding 到 2.5GB 的 *-squashfs-rootfs.img），
+      #   释放磁盘并保证 Release 只上传固件镜像。
+      # ============================================================
+      - name: 【20】压缩镜像为 .img.gz
+        run: |
+          set -euo pipefail
+          cd "$BIN_DIR"
+          shopt -s nullglob
+
+          if command -v pigz >/dev/null 2>&1; then
+            Z=pigz; echo "==> 使用多线程压缩 pigz"
+          else
+            Z=gzip; echo "==> 使用单线程压缩 gzip"
+          fi
+
+          maps=(*squashfs-combined.img *squashfs-combined-efi.img)
+          if [ "${#maps[@]}" -eq 0 ]; then
+            echo "错误: 没有可压缩的镜像"; exit 1
+          fi
+          for img in "${maps[@]}"; do
+            echo "    压缩 $img"
+            "$Z" -9 -f "$img"     # -f 会用 .img.gz 替换掉原 .img
+          done
+
+          # 精确确认两个交付镜像都压缩成功（少一个都不允许继续）
+          for pat in '*squashfs-combined.img.gz' '*squashfs-combined-efi.img.gz'; do
+            ok=0
+            for f in $pat; do [ -f "$f" ] && ok=1; done
+            if [ "$ok" -eq 0 ]; then
+              echo "错误: 压缩后缺少镜像 $pat，拒绝继续发布"
+              ls -lh || true
+              exit 1
+            fi
+          done
+
+          # 清理非交付物
+          #   注意：镜像名带 immortalwrt-x86-64-generic- 前缀，不能写死
+          #   "rootfs.img"。此刻残留的任何 .img 都不是交付物
+          #   （典型是 padding 到 CONFIG_TARGET_ROOTFS_PARTSIZE 的
+          #     *-squashfs-rootfs.img，单个就有 2.5GB），一概删除，
+          #   既保证 Release 只上传固件镜像，也释放磁盘。
+          for f in *.img; do
+            [ -e "$f" ] || continue
+            echo "    清理非交付镜像: $f"
+            rm -f "$f"
+          done
+
+          # 重新生成校验表，保证它只描述最终实际交付的文件
+          #   （必须显式检查非空：nullglob 下若一个都没匹配到，
+          #     sha256sum 会退化成「读标准输入」而卡住）
+          gzfiles=(*squashfs-combined*.img.gz)
+          if [ "${#gzfiles[@]}" -eq 0 ]; then
+            echo "错误: 压缩后未找到任何 .img.gz 文件"; exit 1
+          fi
+          sha256sum "${gzfiles[@]}" > sha256sums
+
+          echo "==> 最终产物："
+          ls -lh *squashfs-combined*.img.gz sha256sums config.buildinfo 2>/dev/null || true
+          echo "==> 校验表内容："
+          cat sha256sums
+
+      # ============================================================
+      # 【21】生成 Release 正文
+      #   调用 scripts/firmware-info.sh 生成 release_info.md，
+      #   内容包含：LAN IP、后台账号密码、内核版本、固件版本、
+      #   已安装插件清单（每行一个，只列应用类插件、不含 kmod）、
+      #   镜像列表与 SHA-256、刷机说明、默认服务状态。
+      #   LAN IP / 密码 / 主机名从 scripts/system-config.sh 实时读取，
+      #   保证说明书与固件永远一致。
+      # ============================================================
+      - name: 【21】生成 Release 正文（firmware-info.sh）
+        run: |
+          set -euo pipefail
+          bash scripts/firmware-info.sh "$BIN_DIR" release_info.md scripts/system-config.sh
+          echo ""
+          echo "==================== release_info.md 预览 ===================="
+          cat release_info.md
+
+      # ============================================================
+      # 【22】创建 GitHub Release 并上传固件
+      #   · Release 正文用 release_info.md；
+      #   · 只上传 squashfs combined 镜像（BIOS + UEFI），
+      #     不传 ISO / VHDX / VMDK / rootfs.img 等任何其它格式；
+      #   · 附带 sha256sums（校验表）与 config.buildinfo（本次编译配置）；
+      #   · 显式 --repo 指向本仓库（不加会因目标仓库推断错误而 403）。
+      # ============================================================
+      - name: 【22】创建 GitHub Release 并上传固件
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          TAG="x86_64-$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)"
+          TITLE="ImmortalWrt X86_64 固件 $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M')"
+
+          assets=("$BIN_DIR"/*squashfs-combined.img.gz)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "错误: 未找到 squashfs-combined 镜像，拒绝创建空的 Release"
+            exit 1
+          fi
+          # 校验表与编译配置：存在才附带，缺了不影响固件本体发布
+          for extra in "$BIN_DIR/sha256sums" "$BIN_DIR/config.buildinfo"; do
+            [ -f "$extra" ] && assets+=("$extra")
+          done
+
+          echo "==> 将发布以下文件："
+          printf '    %s\n' "${assets[@]}"
+
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$TITLE" \
+            --notes-file release_info.md \
+            "${assets[@]}"
+
+          echo "RELEASE_URL=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url -q .url)" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+
+      # ============================================================
+      # 【23】输出发布摘要
+      #   把 release_info.md 全文写进 Actions 运行摘要页，
+      #   编译完直接就能看到 LAN IP、密码、内核版本、插件清单。
+      # ============================================================
+      - name: 【23】输出发布摘要
+        run: |
+          set -euo pipefail
+          {
+            echo "# 编译与发布完成"
+            echo ""
+            echo "- 工作流运行号：${{ github.run_number }}"
+            echo "- 固件发布页：${RELEASE_URL:-（未取到链接，请到 Releases 页面查看）}"
+            echo "- 编译提交：\`${GITHUB_SHA}\`"
+            echo ""
+            echo "---"
+            echo ""
+            cat release_info.md
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "==> 全部完成，固件发布页: ${RELEASE_URL:-未知}"
