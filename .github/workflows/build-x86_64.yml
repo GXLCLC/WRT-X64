@@ -946,34 +946,72 @@ jobs:
       # ---------------------------------------------------------------------
       # 步骤 14：预下载所有源码包
       #   目的：先把 dl 目录补齐，避免编译过程中因网络抖动中断；
-      #         同时把下载失败（缺失源码、路径错误）暴露在编译之前。
+      #         同时把“下载结果不可用”（0 字节 / 错误页）暴露在编译之前。
+      #   【关键】dl 目录下存在“天然为 0 字节”的文件，不能一律判为下载失败。
+      #         cargo 以 dl/cargo 作为 CARGO_HOME，会在其中自动创建
+      #         .package-cache / .package-cache-mutate 两个锁标记文件，
+      #         它们按设计就是 0 字节（由 feeds/packages/devel/cargo-c 等触发），
+      #         与“上游 404 返回空文件”完全是两回事。
+      #         真实源码包（tar.*/zip/7z/crate）绝不会以 "." 开头，
+      #         因此空文件检查统一排除隐藏文件，杜绝误判中断整条流水线。
       # ---------------------------------------------------------------------
       - name: 步骤 14 - 预下载源码包（make download）
         working-directory: immortalwrt
         run: |
           set -euo pipefail
-          make download -j"$(nproc)" || {
-            echo "::warning::并行下载存在失败项，改用串行重试以便暴露具体缺失项"
-            make download -j1 V=s
-          }
 
-          # 空文件通常代表上游 404 / 镜像返回错误页，这里直接判定为拉取失败
-          EMPTY_FILES="$(find dl -type f -empty 2>/dev/null | head -50 || true)"
+          # 下载阶段的完整输出落盘为 download.log，失败时由步骤 20 上传
+          DL_LOG="$GITHUB_WORKSPACE/download.log"
+          : > "$DL_LOG"
+
+          # 并行下载；失败则串行重试以暴露具体缺失项。
+          # 说明：make download 覆盖整棵源码树（含大量未选中的 feed 包），
+          #       外围包的偶发下载失败不应中断本次构建，故此处只记录状态；
+          #       源码是否真正缺失，由紧随其后的 0 字节检查与步骤 15 严格编译兜底。
+          DL_RC=0
+          if ! make download -j"$(nproc)" 2>&1 | tee -a "$DL_LOG"; then
+            echo "::warning::并行下载存在失败项，改用串行重试以便暴露具体缺失项"
+            make download -j1 V=s 2>&1 | tee -a "$DL_LOG" || DL_RC=1
+          fi
+
+          # 0 字节通常代表上游 404 / 镜像返回错误页，判定为拉取失败；
+          # 但必须排除天然为空的隐藏文件（见上方步骤说明中的 cargo 锁标记）。
+          EMPTY_FILES="$(find dl -type f -empty ! -name '.*' 2>/dev/null | sort | head -50 || true)"
+          IGNORED_EMPTY="$(find dl -type f -empty -name '.*' 2>/dev/null | sort | head -20 || true)"
+
+          if [ -n "$IGNORED_EMPTY" ]; then
+            {
+              echo "已忽略以下天然为空的隐藏文件（cargo 缓存/锁标记等，非下载失败）："
+              echo "$IGNORED_EMPTY"
+            } 2>&1 | tee -a "$DL_LOG"
+          fi
+
           if [ -n "$EMPTY_FILES" ]; then
-            echo "==================== 源码包下载校验失败 ===================="
-            echo "缺失项       : 出现 0 字节的下载文件（上游 404 或错误页）"
-            echo "来源仓库     : 由各软件包 Makefile 的 PKG_SOURCE_URL 决定"
-            echo "期望路径     : immortalwrt/dl/"
-            echo "检测命令     : find dl -type f -empty"
-            echo "实际检测结果 :"
-            echo "$EMPTY_FILES"
-            echo "可能原因     : 上游仓库分支/标签变更导致下载地址失效。"
-            echo "建议修复方向 : 按上列文件名定位对应包的 Makefile，核对 PKG_SOURCE_URL 与 PKG_HASH。"
-            echo "==========================================================="
+            {
+              echo "==================== 源码包下载校验失败 ===================="
+              echo "缺失项       : 出现 0 字节的下载文件（上游 404 或错误页）"
+              echo "来源仓库     : 由各软件包 Makefile 的 PKG_SOURCE_URL 决定"
+              echo "期望路径     : immortalwrt/dl/"
+              echo "检测命令     : find dl -type f -empty ! -name '.*'"
+              echo "实际检测结果 :"
+              echo "$EMPTY_FILES"
+              echo "文件详情（修改时间 / 路径）："
+              find dl -type f -empty ! -name '.*' \
+                -printf '%TY-%Tm-%Td %TH:%TM  %p\n' 2>/dev/null | sort | head -50 || true
+              echo "可能原因     : 上游仓库分支/标签变更导致下载地址失效。"
+              echo "建议修复方向 : 按上列文件名定位对应包的 Makefile，核对 PKG_SOURCE_URL 与 PKG_HASH。"
+              echo "==========================================================="
+            } 2>&1 | tee -a "$DL_LOG"
             echo "::error::dl 目录存在 0 字节下载文件，拉取失败"
             exit 1
           fi
-          echo "dl 目录大小：$(du -sh dl | cut -f1)"
+
+          echo "dl 目录大小：$(du -sh dl | cut -f1)" | tee -a "$DL_LOG"
+          if [ "$DL_RC" != "0" ]; then
+            echo "::warning::make download 返回非 0（常见于未选中的 feed 包或镜像临时不可用），"
+            echo "           但 dl 目录未发现 0 字节损坏文件；编译阶段会重新尝试下载缺失源码，"
+            echo "           若确实无法获取，步骤 15 严格编译会立即失败并给出精确报错。"
+          fi
 
       # ---------------------------------------------------------------------
       # 步骤 15：编译固件（严格模式）
@@ -984,6 +1022,7 @@ jobs:
       #     - 全程 tee 到 build.log，便于失败时上传完整日志。
       # ---------------------------------------------------------------------
       - name: 步骤 15 - 编译固件（严格模式，任一包失败立即终止）
+        id: build
         working-directory: immortalwrt
         run: |
           set -o pipefail
@@ -996,9 +1035,13 @@ jobs:
       #   目的：并行编译的报错信息会交错，难以定位。失败后以 -j1 V=s 重新执行，
       #         输出真正出错的软件包与完整编译命令，追加写入同一份 build.log。
       #   说明：该步骤一定不会让工作流“变成成功”，仅用于补充日志。
+      #   条件：仅当“步骤 15 本身失败”时才重跑。
+      #         若步骤 15 根本没执行（例如前面的步骤 14 失败导致其被跳过），
+      #         这里再跑一遍完整串行编译毫无意义 —— 既白耗约 1.5 小时机时，
+      #         又会产出一份“编译其实成功”的日志，把真正的故障原因掩盖掉。
       # ---------------------------------------------------------------------
       - name: 步骤 16 - 编译失败时串行重跑以定位错误
-        if: failure()
+        if: failure() && steps.build.outcome == 'failure'
         continue-on-error: true
         working-directory: immortalwrt
         run: |
@@ -1146,17 +1189,23 @@ jobs:
           if-no-files-found: error
 
       # ---------------------------------------------------------------------
-      # 步骤 20：编译失败时上传完整日志
+      # 步骤 20：失败时上传完整日志
       #   目的：需求要求编译失败必须上传完整日志用于排查错误与 Bug。
-      #         同时上传校验日志（若有），便于确认是编译失败还是产物校验失败。
+      #   收录内容：
+      #     build.log    —— 步骤 15/16 的完整编译日志（若编译阶段未执行则不存在）
+      #     download.log —— 步骤 14 的源码预下载日志（若失败在下载阶段，靠它排查）
+      #     verify.log   —— 步骤 17 的产物校验日志（若该步骤未执行则不存在）
+      #   说明：三个文件都是“按实际发生情况”存在，故使用 if-no-files-found: ignore，
+      #         避免某个阶段没跑到时反而让上传步骤本身报错。
       # ---------------------------------------------------------------------
-      - name: 步骤 20 - 编译失败时上传完整编译日志
+      - name: 步骤 20 - 失败时上传完整日志（编译/下载/校验）
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: build-log-${{ github.run_number }}
           path: |
             build.log
+            download.log
             verify.log
           if-no-files-found: ignore
 
