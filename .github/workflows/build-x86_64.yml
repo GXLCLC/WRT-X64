@@ -7,11 +7,13 @@
 #   1. 仅 workflow_dispatch 手动触发，无 push / schedule 自动触发
 #   2. 源码固定 immortalwrt/immortalwrt 的 openwrt-24.10 分支
 #   3. 编译环境固定 Ubuntu 24.04 LTS（ubuntu-24.04）
-#   4. 仅编译 X86_64 架构，仅产出 squashfs-combined.img
+#   4. 仅编译 X86_64 架构，仅产出 squashfs-combined.img（overlay 分区 2048 MiB）
 #   5. 时区 Asia/Shanghai、argon 为默认主题
 #   6. 第三方插件按“稀疏浅克隆 + 路径/分支校验”拉取，校验失败立即终止
 #   7. 编译严格模式：任一软件包编译失败立即终止
-#   8. 失败时上传完整日志；成功后自动创建 Release（仅上传 squashfs-combined.img）
+#   8. 失败时上传完整日志；成功后自动创建 Release
+#      发布对象为 squashfs-combined.img.gz —— 2G overlay 使原始 .img 约 2.2 GiB，
+#      超过 GitHub Release 单文件 2 GiB 硬上限（HTTP 422），故压缩后发布。
 # =============================================================================
 
 name: 编译 ImmortalWrt X86_64 固件
@@ -29,7 +31,7 @@ on:
         type: boolean
         default: false
       upload_artifact:
-        description: "是否把固件同时作为 Actions Artifact 上传（Release 始终只发布 squashfs-combined.img）"
+        description: "是否把固件（.img.gz）同时作为 Actions Artifact 上传（Release 始终只发布 squashfs-combined.img.gz）"
         required: false
         type: boolean
         default: true
@@ -911,23 +913,126 @@ jobs:
           echo "image_name=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
 
       # ---------------------------------------------------------------------
-      # 步骤 18：上传固件 Artifact
-      #   目的：便于在 Actions 页面直接下载固件（可选，不影响 Release 内容）。
+      # 步骤 18：压缩固件为 img.gz
+      #   目的：2G overlay 使原始 squashfs-combined.img 约 2.2 GiB，
+      #         超过 GitHub Release 单文件 2 GiB 硬上限
+      #         （HTTP 422 size must be less than 2147483648）。
+      #         这里用 gzip -9 压缩后再发布，上传体积通常降到 ~200 MiB。
+      #   说明：rootfs 分区由 gen_image_generic.sh 用 dd if=/dev/zero 填充，
+      #         2 GiB 分区中除 squashfs 实际数据外全为零字节，压缩率极高。
+      #         原始 .img 保留在原地，供步骤 17 已完成的分区/魔数校验追溯。
+      #   注意：此处不使用 OpenWrt 内置的 CONFIG_TARGET_IMAGES_GZIP，
+      #         因为该开关在 x86 image/Makefile 中是 if/else 互斥的——
+      #         开启后只产出 .img.gz 而不再产出 .img，会使产物校验失去依据。
       # ---------------------------------------------------------------------
-      - name: 步骤 18 - 上传固件 Artifact
+      - name: 步骤 18 - 压缩固件为 img.gz（规避 Release 单文件 2GiB 上限）
+        id: pack
+        if: success()
+        env:
+          IMAGE_PATH: ${{ steps.verify.outputs.image_path }}
+          IMAGE_NAME: ${{ steps.verify.outputs.image_name }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "$IMAGE_PATH" ]; then
+            echo "==================== 固件压缩失败 ===================="
+            echo "缺失项       : 待压缩的原始镜像"
+            echo "期望路径     : ${IMAGE_PATH}"
+            echo "实际检测结果 : 文件不存在"
+            echo "可能原因     : 产物在校验之后被移动或删除。"
+            echo "====================================================="
+            echo "::error::待压缩镜像不存在：${IMAGE_PATH}"
+            exit 1
+          fi
+
+          GZ_PATH="${IMAGE_PATH}.gz"
+          GZ_NAME="${IMAGE_NAME}.gz"
+          RAW_SIZE="$(stat -c '%s' "$IMAGE_PATH")"
+
+          echo "原始镜像 : ${IMAGE_NAME}"
+          echo "原始体积 : ${RAW_SIZE} 字节"
+
+          # 磁盘空间前置检查：压缩期间 .img 与 .img.gz 并存，
+          # 最坏情况（几乎不可压缩）需再占用 RAW_SIZE 空间，故按此校验。
+          AVAIL_KB="$(df -Pk "$(dirname "$GZ_PATH")" | awk 'NR==2{print $4}')"
+          AVAIL_BYTES="$((AVAIL_KB * 1024))"
+          echo "可用空间 : ${AVAIL_BYTES} 字节"
+          if [ "$AVAIL_BYTES" -lt "$RAW_SIZE" ]; then
+            echo "==================== 固件压缩失败 ===================="
+            echo "检测项       : 压缩所需磁盘空间"
+            echo "检测命令     : df -Pk $(dirname "$GZ_PATH")"
+            echo "期望值       : 可用空间 >= ${RAW_SIZE} 字节（最坏情况需与 .img 等大）"
+            echo "实际值       : ${AVAIL_BYTES} 字节"
+            echo "可能原因     : runner 磁盘空间不足（swap 占用了 8G，或编译产物过多）。"
+            echo "建议修复方向 : 压缩前临时关闭 swap 并删除 /swapfile 释放空间。"
+            echo "====================================================="
+            echo "::error::磁盘空间不足以完成 gzip 压缩"
+            exit 1
+          fi
+
+          # -9 最高压缩级别。零填充区几乎不占体积，故整体压缩率很高。
+          echo "开始压缩 ..."
+          gzip -9 -c "$IMAGE_PATH" > "$GZ_PATH"
+
+          if [ ! -s "$GZ_PATH" ]; then
+            echo "==================== 固件压缩失败 ===================="
+            echo "缺失项       : gzip 压缩产物"
+            echo "期望路径     : ${GZ_PATH}"
+            echo "实际检测结果 : 文件不存在或为空"
+            echo "可能原因     : gzip 执行异常或磁盘空间不足。"
+            echo "====================================================="
+            echo "::error::gzip 压缩失败"
+            exit 1
+          fi
+
+          GZ_SIZE="$(stat -c '%s' "$GZ_PATH")"
+          RATIO="$(awk -v a="$RAW_SIZE" -v b="$GZ_SIZE" 'BEGIN{ if (a>0) printf "%.2f", (1-b/a)*100; else print "0" }')"
+          echo "压缩产物 : ${GZ_NAME}"
+          echo "压缩体积 : ${GZ_SIZE} 字节（体积减少 ${RATIO}%）"
+
+          # GitHub Release 单文件硬上限 2147483648 字节（2 GiB）
+          LIMIT=2147483648
+          if [ "$GZ_SIZE" -ge "$LIMIT" ]; then
+            echo "==================== 固件压缩后仍超出上传上限 ===================="
+            echo "检测项       : 压缩产物体积 vs Release 单文件上限"
+            echo "检测命令     : stat -c '%s' ${GZ_NAME}"
+            echo "期望值       : < ${LIMIT} 字节（2 GiB）"
+            echo "实际值       : ${GZ_SIZE} 字节"
+            echo "可能原因     : 固件内含大量不可压缩数据（例如已压缩的二进制被再次打包），"
+            echo "                或 CONFIG_TARGET_ROOTFS_PARTSIZE 设置过大。"
+            echo "建议修复方向 : 1) 下调 config/X86_64.config 中 CONFIG_TARGET_ROOTFS_PARTSIZE"
+            echo "                （当前 2048 => 2G overlay），改为 1024 可显著减小体积；"
+            echo "                2) 或改用多卷压缩（split）方式上传。"
+            echo "=================================================================="
+            echo "::error::压缩后固件仍超过 2GiB，无法上传到 Release"
+            exit 1
+          fi
+          echo "体积检查通过：${GZ_SIZE} < ${LIMIT}（GitHub Release 单文件上限）"
+
+          echo "gz_path=${GZ_PATH}" >> "$GITHUB_OUTPUT"
+          echo "gz_name=${GZ_NAME}" >> "$GITHUB_OUTPUT"
+          echo "raw_size=${RAW_SIZE}" >> "$GITHUB_OUTPUT"
+          echo "gz_size=${GZ_SIZE}" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------------
+      # 步骤 19：上传固件 Artifact
+      #   目的：便于在 Actions 页面直接下载固件（可选，不影响 Release 内容）。
+      #         上传压缩后的 .img.gz，避免 Artifact 体积过大。
+      # ---------------------------------------------------------------------
+      - name: 步骤 19 - 上传固件 Artifact
         if: success() && inputs.upload_artifact
         uses: actions/upload-artifact@v4
         with:
           name: immortalwrt-x86_64-squashfs-combined
-          path: ${{ steps.verify.outputs.image_path }}
+          path: ${{ steps.pack.outputs.gz_path }}
           if-no-files-found: error
 
       # ---------------------------------------------------------------------
-      # 步骤 19：编译失败时上传完整日志
+      # 步骤 20：编译失败时上传完整日志
       #   目的：需求要求编译失败必须上传完整日志用于排查错误与 Bug。
       #         同时上传校验日志（若有），便于确认是编译失败还是产物校验失败。
       # ---------------------------------------------------------------------
-      - name: 步骤 19 - 编译失败时上传完整编译日志
+      - name: 步骤 20 - 编译失败时上传完整编译日志
         if: failure()
         uses: actions/upload-artifact@v4
         with:
@@ -938,15 +1043,17 @@ jobs:
           if-no-files-found: ignore
 
       # ---------------------------------------------------------------------
-      # 步骤 20：生成 Release 说明
+      # 步骤 21：生成 Release 说明
       #   目的：自动填充后台登录 IP / 账号 / 密码 / 内核版本 / 固件版本 /
       #         已安装插件清单（仅应用插件，不含 kmod 内核模块驱动）。
+      #         因最终发布的是 .img.gz，说明中同步给出解压方法与压缩包 SHA256。
       # ---------------------------------------------------------------------
-      - name: 步骤 20 - 生成 Release 说明（固件信息与插件清单）
+      - name: 步骤 21 - 生成 Release 说明（固件信息与插件清单）
         if: success()
         id: notes
         env:
           IMAGE_NAME: ${{ steps.verify.outputs.image_name }}
+          GZ_NAME: ${{ steps.pack.outputs.gz_name }}
           LAN_IP: ${{ env.LAN_IP }}
           ROOT_PASSWORD: ${{ env.ROOT_PASSWORD }}
         run: |
@@ -960,40 +1067,66 @@ jobs:
             "${IMAGE_NAME}" \
             "${TAG}" \
             "${{ github.repository }}" \
-            "$(cat "$GITHUB_WORKSPACE/.immortalwrt-sha" 2>/dev/null || echo unknown)"
+            "$(cat "$GITHUB_WORKSPACE/.immortalwrt-sha" 2>/dev/null || echo unknown)" \
+            "${GZ_NAME}"
           echo "---------- Release 说明预览 ----------"
           cat "$GITHUB_WORKSPACE/RELEASE_NOTES.md"
 
       # ---------------------------------------------------------------------
-      # 步骤 21：创建 GitHub Release
+      # 步骤 22：创建 GitHub Release
       #   目的：编译成功后自动发布固件。
-      #         仅上传 squashfs-combined.img，过滤其它多余产物（如 combined-efi.img、
-      #         manifest、profiles.json、sha256sums 等均不发布）。
+      #         仅上传 squashfs-combined.img.gz，过滤其它多余产物
+      #         （combined-efi.img、manifest、profiles.json、sha256sums 等均不发布）。
+      #   说明：原始 .img 约 2.2 GiB，超过 Release 单文件 2 GiB 上限，
+      #         故发布步骤 18 压缩得到的 .img.gz。
       # ---------------------------------------------------------------------
-      - name: 步骤 21 - 创建 GitHub Release（仅发布 squashfs-combined.img）
+      - name: 步骤 22 - 创建 GitHub Release（仅发布 squashfs-combined.img.gz）
         if: success()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GZ_PATH: ${{ steps.pack.outputs.gz_path }}
+          GZ_NAME: ${{ steps.pack.outputs.gz_name }}
           IMAGE_PATH: ${{ steps.verify.outputs.image_path }}
           IMAGE_NAME: ${{ steps.verify.outputs.image_name }}
+          GZ_SIZE: ${{ steps.pack.outputs.gz_size }}
           TAG: ${{ steps.notes.outputs.release_tag }}
         run: |
           set -euo pipefail
 
-          if [ ! -f "$IMAGE_PATH" ]; then
+          # 前置校验 1：压缩产物必须存在
+          if [ ! -f "$GZ_PATH" ]; then
             echo "==================== 发布前置校验失败 ===================="
-            echo "缺失项       : squashfs-combined.img"
+            echo "缺失项       : squashfs-combined.img.gz"
             echo "产物目录     : ${{ env.SRC_DIR }}/bin/targets/x86/64"
-            echo "期望路径     : ${IMAGE_PATH}"
+            echo "期望路径     : ${GZ_PATH}"
             echo "实际检测结果 : 文件不存在"
-            echo "可能原因     : 产物在校验之后被移动或删除。"
+            echo "可能原因     : 步骤 18 压缩产物在校验之后被移动或删除。"
             echo "========================================================="
-            echo "::error::待发布的固件不存在：${IMAGE_PATH}"
+            echo "::error::待发布的固件压缩包不存在：${GZ_PATH}"
             exit 1
           fi
 
-          echo "发布对象：$IMAGE_NAME"
+          # 前置校验 2：再次确认未超过 Release 单文件 2 GiB 上限
+          #           （步骤 18 已校验，这里兜底，避免上传阶段才报 HTTP 422）
+          LIMIT=2147483648
+          ACTUAL_SIZE="$(stat -c '%s' "$GZ_PATH")"
+          if [ "$ACTUAL_SIZE" -ge "$LIMIT" ]; then
+            echo "==================== 发布前置校验失败 ===================="
+            echo "检测项       : 发布对象体积 vs Release 单文件上限"
+            echo "检测命令     : stat -c '%s' ${GZ_NAME}"
+            echo "期望值       : < ${LIMIT} 字节（2 GiB）"
+            echo "实际值       : ${ACTUAL_SIZE} 字节"
+            echo "可能原因     : 压缩产物异常增大。"
+            echo "建议修复方向 : 下调 config 中 CONFIG_TARGET_ROOTFS_PARTSIZE 后重新编译。"
+            echo "========================================================="
+            echo "::error::发布对象超过 2GiB，GitHub Release 将拒绝上传（HTTP 422）"
+            exit 1
+          fi
+
+          echo "发布对象：${GZ_NAME}（${ACTUAL_SIZE} 字节）"
+          echo "原始镜像：${IMAGE_NAME}（仅本地校验，不上传）"
           echo "Tag     ：$TAG"
+          echo "说明文件：RELEASE_NOTES.md"
 
           gh release create "$TAG" \
             --repo "${{ github.repository }}" \
@@ -1001,6 +1134,6 @@ jobs:
             --title "ImmortalWrt X86_64 固件 ${TAG}" \
             --notes-file "$GITHUB_WORKSPACE/RELEASE_NOTES.md" \
             --latest \
-            "$IMAGE_PATH"
+            "$GZ_PATH"
 
           echo "Release 创建完成：${{ github.server_url }}/${{ github.repository }}/releases/tag/${TAG}"
