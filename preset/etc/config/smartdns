@@ -1,0 +1,55 @@
+# ---------------------------------------------------------------------------
+# 本文件由 WRT-X64 云编译工作流预置，整文件覆盖 smartdns 包自带默认配置。
+#
+# 按需求约定：
+#   * enabled            = 0  —— 默认不启用 SmartDNS
+#   * auto_set_dnsmasq   = 0  —— 不自动把 SmartDNS 设置为 dnsmasq 的上游
+#   * 预写入 5 个上游 DNS 服务器（协议类型均选 udp，端口一律留空不填）
+#         114.114.114.114  -> 114DNS
+#         223.5.5.5        -> 阿里DNS
+#         180.184.1.1      -> 字节跳动
+#         119.29.29.29     -> 腾讯DNS
+#         8.8.8.8          -> 谷歌DNS
+#
+# 字段说明（对应 LuCI「SmartDNS -> 上游服务器」表格）：
+#   name  —— 界面上显示的服务器名称（仅用于展示）
+#   ip    —— 上游 DNS 地址
+#   type  —— 协议类型，udp / tcp / tls / https / quic / h3，此处固定 udp
+#   port  —— 端口，留空表示使用该协议的默认端口（udp 即 53）
+# ---------------------------------------------------------------------------
+
+config smartdns
+	option enabled '0'
+	option auto_set_dnsmasq '0'
+
+config server
+	option enabled '1'
+	option name '114DNS'
+	option ip '114.114.114.114'
+	option type 'udp'
+
+config server
+	option enabled '1'
+	option name '阿里DNS'
+	option ip '223.5.5.5'
+	option type 'udp'
+
+config server
+	option enabled '1'
+	option name '字节跳动'
+	option ip '180.184.1.1'
+	option type 'udp'
+
+config server
+	option enabled '1'
+	option name '腾讯DNS'
+	option ip '119.29.29.29'
+	option type 'udp'
+
+config server
+	option enabled '1'
+	option name '谷歌DNS'
+	option ip '8.8.8.8'
+	option type 'udp'
+
+config domain-rule

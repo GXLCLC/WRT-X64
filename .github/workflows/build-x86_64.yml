@@ -334,14 +334,7 @@ jobs:
           rm -rf "$IW/package/appfilter"
           cp -rf "$d/open-app-filter" "$IW/package/appfilter"
 
-          # ---- 7.5 OpenClash（kenzok8/small-package） ----
-          # 仅集成这一个代理类插件。
-          d="$(sparse_pull "luci-app-openclash" "${{ env.KENZOK8_SMALL }}" \
-                "${{ env.KENZOK8_SMALL_BRANCH }}" openclash luci-app-openclash)"
-          rm -rf "$IW/package/luci-app-openclash"
-          cp -rf "$d/luci-app-openclash" "$IW/package/luci-app-openclash"
-
-          # ---- 7.6 EasyTier（kenzok8/small-package，容器目录含内核与 LuCI） ----
+          # ---- 7.5 EasyTier（kenzok8/small-package，容器目录含内核与 LuCI） ----
           # 注意：该仓库里的 luci-app-easytier 是「容器目录」，顶层没有 Makefile，
           #   其内部结构为：
           #     easytier/           —— EasyTier 本体（PKG_NAME:=easytier，含核心二进制安装）
@@ -369,7 +362,6 @@ jobs:
                    package/oaf/Makefile \
                    package/luci-app-oaf/Makefile \
                    package/appfilter/Makefile \
-                   package/luci-app-openclash/Makefile \
                    package/luci-app-easytier/luci-app-easytier/Makefile \
                    package/luci-app-easytier/easytier/Makefile; do
             if [ -f "$IW/$p" ]; then
@@ -551,14 +543,14 @@ jobs:
           echo "libnftnl / firewall4 / nftables 替换校验通过"
 
       # ---------------------------------------------------------------------
-      # 步骤 9：预置插件核心二进制
+      # 步骤 9：预置 AdGuardHome 核心二进制
       #   目的：满足“完整打包程序核心”的要求。
       #         - AdGuardHome：放入 files/ 覆盖层，随固件打包到 /usr/bin/AdGuardHome，
       #           LuCI 应用检测到该文件后无需联网下载即可启动。
-      #         - OpenClash：放入包目录 root/etc/openclash/core/，随 ipk 一起安装。
-      #   注意：两个核心都与当前固件同为 x86_64，来源为官方发布页。
+      #   注意：核心与当前固件同为 x86_64，来源为官方发布页。
+      #         OpenClash 已按需求移除，其核心不再预置。
       # ---------------------------------------------------------------------
-      - name: 步骤 9 - 预置 AdGuardHome 与 OpenClash 核心二进制
+      - name: 步骤 9 - 预置 AdGuardHome 核心二进制
         run: |
           set -euo pipefail
           IW="$(pwd)/${{ env.SRC_DIR }}"
@@ -587,30 +579,6 @@ jobs:
           echo "AdGuardHome 核心已预置：$IW/files/usr/bin/AdGuardHome ($(stat -c '%s' "$IW/files/usr/bin/AdGuardHome") 字节)"
           "$IW/files/usr/bin/AdGuardHome" --version || true
 
-          # ---- 9.2 OpenClash 核心（Meta/mihomo，x86_64） ----
-          CLASH_URL="https://raw.githubusercontent.com/vernesong/OpenClash/core/master/meta/clash-linux-amd64.tar.gz"
-          echo "下载 OpenClash 核心：${CLASH_URL}"
-          curl -fL --retry 3 --retry-delay 5 -o "$TMP/clash.tar.gz" "$CLASH_URL"
-          mkdir -p "$TMP/clash"
-          tar -xzf "$TMP/clash.tar.gz" -C "$TMP/clash"
-          CLASH_SRC="$(find "$TMP/clash" -maxdepth 2 -type f | head -1)"
-          if [ -z "$CLASH_SRC" ]; then
-            echo "==================== OpenClash 核心预置失败 ===================="
-            echo "缺失项       : OpenClash 内核可执行文件"
-            echo "来源仓库     : https://github.com/vernesong/OpenClash （core 分支 meta 目录）"
-            echo "期望路径     : meta/clash-linux-amd64.tar.gz 解压后有可执行文件"
-            echo "实际检测结果 : 解压目录为空"
-            echo "可能原因     : 上游 core 分支目录结构变更。"
-            echo "建议修复方向 : 确认 core 分支下 meta/ 目录的资产名，修改本步骤 CLASH_URL。"
-            echo "==============================================================="
-            echo "::error::OpenClash 核心解压后找不到可执行文件"
-            exit 1
-          fi
-          OC_CORE_DIR="$IW/package/luci-app-openclash/root/etc/openclash/core"
-          mkdir -p "$OC_CORE_DIR"
-          install -m 0755 "$CLASH_SRC" "$OC_CORE_DIR/clash_meta"
-          echo "OpenClash 核心已预置：$OC_CORE_DIR/clash_meta ($(stat -c '%s' "$OC_CORE_DIR/clash_meta") 字节)"
-
       # ---------------------------------------------------------------------
       # 步骤 10：应用固件定制
       #   目的：把需求中要求的内置项写进源码，避免只在运行时用脚本修补：
@@ -618,9 +586,12 @@ jobs:
       #         - 默认 LAN 地址 192.168.2.1
       #         - root 默认密码 12345678（写入 /etc/shadow，首次启动即生效）
       #         - argon 主题设为系统默认主题
+      #         - 用仓库 preset/ 目录整文件覆盖 mwan3 / SmartDNS / AdGuardHome
+      #           的包默认配置（清空 mwan3 接口成员策略、SmartDNS 上游与开关、
+      #           AdGuardHome 开关与上游 DNS / 黑名单清单）
       #         - 追加 files/ 覆盖层作为二次兜底
       # ---------------------------------------------------------------------
-      - name: 步骤 10 - 应用固件定制（时区/默认IP/默认密码/默认主题）
+      - name: 步骤 10 - 应用固件定制（时区/默认IP/默认密码/默认主题/预置配置）
         env:
           LAN_IP: ${{ env.LAN_IP }}
           ROOT_PASSWORD: ${{ env.ROOT_PASSWORD }}
@@ -733,7 +704,140 @@ jobs:
           grep -q '/luci-static/argon' "$LUCI_CFG" || { echo "::error::默认主题改写失败"; exit 1; }
           echo "argon 已设置为系统默认主题"
 
-          # ---------- 10.4 files/ 覆盖层（二次兜底 + 运行期保险） ----------
+          # ---------- 10.4 files/ 覆盖层（预置配置文件） ----------
+          # 10.4.1 用仓库 preset/ 目录整文件覆盖插件包自带的默认配置
+          #   机制说明：OpenWrt buildroot 在镜像打包阶段（include/image.mk 的
+          #   prepare_rootfs）会在所有 ipk 安装完成之后，把源码树顶层 files/
+          #   目录整体拷贝进 rootfs，因此这里的预置文件优先级高于软件包自带配置。
+          #
+          #   - preset/etc/config/mwan3      ：接口/成员/策略全部留空，仅保留 3 条默认规则
+          #   - preset/etc/config/smartdns   ：enabled=0、auto_set_dnsmasq=0、5 个上游服务器
+          #   - preset/etc/config/AdGuardHome：enabled=0（默认不启用）
+          #   - preset/etc/AdGuardHome.yaml  ：上游 DNS 114.114.114.114/223.5.5.5、
+          #                                    黑名单仅保留 anti-ad 与海哥清单两条
+          PRESET_DIR="$GITHUB_WORKSPACE/preset"
+          if [ ! -d "$PRESET_DIR" ]; then
+            echo "==================== 预置配置写入失败 ===================="
+            echo "定制项       : files/ 覆盖层预置配置文件"
+            echo "来源         : 本仓库 preset/ 目录"
+            echo "期望路径     : ${PRESET_DIR}"
+            echo "实际检测结果 : 目录不存在"
+            echo "可能原因     : 检出本仓库时 preset/ 目录缺失（被删除或未被跟踪）。"
+            echo "建议修复方向 : 确认仓库根目录存在 preset/etc/config/{mwan3,smartdns,AdGuardHome}"
+            echo "               与 preset/etc/AdGuardHome.yaml 并重新提交。"
+            echo "=========================================================="
+            echo "::error::未找到 preset/ 目录，无法写入预置配置"
+            exit 1
+          fi
+          mkdir -p "$IW/files"
+          cp -rf "$PRESET_DIR/." "$IW/files/"
+
+          PRESET_FILES="etc/config/mwan3 etc/config/smartdns etc/config/AdGuardHome etc/AdGuardHome.yaml"
+          for f in $PRESET_FILES; do
+            if [ ! -s "$IW/files/$f" ]; then
+              echo "==================== 预置配置写入失败 ===================="
+              echo "定制项       : files/$f"
+              echo "来源         : ${PRESET_DIR}/$f"
+              echo "期望路径     : $IW/files/$f"
+              echo "实际检测结果 : 文件不存在或为 0 字节"
+              echo "可能原因     : preset/ 目录内容不完整。"
+              echo "建议修复方向 : 补齐 ${PRESET_DIR}/$f 后重新提交。"
+              echo "=========================================================="
+              echo "::error::预置配置文件未落位：$f"
+              exit 1
+            fi
+          done
+
+          # 10.4.2 预置内容结构化校验（防止只“拷过去”而内容不符合需求）
+          #   mwan3：接口 / 成员 / 策略必须为 0 个，默认规则必须为 3 条
+          MWAN3_F="$IW/files/etc/config/mwan3"
+          MWAN3_IFACE="$(grep -cE "^config[[:space:]]+interface[[:space:]]" "$MWAN3_F" || true)"
+          MWAN3_MEMBER="$(grep -cE "^config[[:space:]]+member[[:space:]]" "$MWAN3_F" || true)"
+          MWAN3_POLICY="$(grep -cE "^config[[:space:]]+policy[[:space:]]" "$MWAN3_F" || true)"
+          MWAN3_RULE="$(grep -cE "^config[[:space:]]+rule[[:space:]]" "$MWAN3_F" || true)"
+          echo "mwan3 预置：interface=${MWAN3_IFACE} member=${MWAN3_MEMBER} policy=${MWAN3_POLICY} rule=${MWAN3_RULE}"
+          if [ "$MWAN3_IFACE" != "0" ] || [ "$MWAN3_MEMBER" != "0" ] || [ "$MWAN3_POLICY" != "0" ] || [ "$MWAN3_RULE" != "3" ]; then
+            echo "==================== 预置配置内容校验失败 ===================="
+            echo "定制项       : mwan3 默认配置（接口/成员/策略留空，仅保留默认规则）"
+            echo "来源         : ${PRESET_DIR}/etc/config/mwan3"
+            echo "期望值       : interface=0 member=0 policy=0 rule=3"
+            echo "实际值       : interface=${MWAN3_IFACE} member=${MWAN3_MEMBER} policy=${MWAN3_POLICY} rule=${MWAN3_RULE}"
+            echo "可能原因     : preset/etc/config/mwan3 被改动，重新引入了接口/成员/策略。"
+            echo "建议修复方向 : 删除 config interface / config member / config policy 段，"
+            echo "               只保留 globals 与 https、default_rule_v4、default_rule_v6 三条规则。"
+            echo "==============================================================="
+            echo "::error::mwan3 预置配置不符合需求"
+            exit 1
+          fi
+
+          #   SmartDNS：enabled=0、auto_set_dnsmasq=0、server 段 5 个、每段 type=udp
+          SD_F="$IW/files/etc/config/smartdns"
+          SD_ENABLED="$(sed -n "s/^[[:space:]]*option enabled '\\([01]\\)'.*/\\1/p" "$SD_F" | head -1)"
+          SD_AUTODNS="$(sed -n "s/^[[:space:]]*option auto_set_dnsmasq '\\([01]\\)'.*/\\1/p" "$SD_F" | head -1)"
+          SD_SERVER="$(grep -cE "^config[[:space:]]+server[[:space:]]*$" "$SD_F" || true)"
+          SD_UDP="$(grep -cE "^[[:space:]]+option type 'udp'" "$SD_F" || true)"
+          SD_PORT="$(grep -cE "^[[:space:]]+option port " "$SD_F" || true)"
+          echo "smartdns 预置：enabled=${SD_ENABLED} auto_set_dnsmasq=${SD_AUTODNS} server=${SD_SERVER} type=udp=${SD_UDP} port=${SD_PORT}"
+          if [ "$SD_ENABLED" != "0" ] || [ "$SD_AUTODNS" != "0" ] || [ "$SD_SERVER" != "5" ] || [ "$SD_UDP" != "5" ] || [ "$SD_PORT" != "0" ]; then
+            echo "==================== 预置配置内容校验失败 ===================="
+            echo "定制项       : SmartDNS 默认配置（不启用、不自动设置 dnsmasq、5 个上游服务器）"
+            echo "来源         : ${PRESET_DIR}/etc/config/smartdns"
+            echo "期望值       : enabled=0 auto_set_dnsmasq=0 server=5 type=udp=5 port=0"
+            echo "实际值       : enabled=${SD_ENABLED} auto_set_dnsmasq=${SD_AUTODNS} server=${SD_SERVER} type=udp=${SD_UDP} port=${SD_PORT}"
+            echo "可能原因     : preset/etc/config/smartdns 被改动，或上游 DNS 条目增减/协议类型被改。"
+            echo "建议修复方向 : 保证 config smartdns 段内 enabled='0'、auto_set_dnsmasq='0'，"
+            echo "               并保留 5 个 config server 段（type 全为 udp，不写 port）。"
+            echo "==============================================================="
+            echo "::error::SmartDNS 预置配置不符合需求"
+            exit 1
+          fi
+          for IP in '114.114.114.114' '223.5.5.5' '180.184.1.1' '119.29.29.29' '8.8.8.8'; do
+            if ! grep -qF "option ip '${IP}'" "$SD_F"; then
+              echo "::error::SmartDNS 上游服务器缺失：${IP}"
+              exit 1
+            fi
+          done
+
+          #   AdGuardHome：UCI 内不启用；YAML 内上游 DNS 两项、黑名单恰好两条指定链接
+          ADG_CFG="$IW/files/etc/config/AdGuardHome"
+          ADG_ENABLED="$(sed -n "s/^[[:space:]]*option enabled '\\([01]\\)'.*/\\1/p" "$ADG_CFG" | head -1)"
+          ADG_YAML="$IW/files/etc/AdGuardHome.yaml"
+          ADG_FILTER_N="$(grep -cE '^[[:space:]]+-[[:space:]]+enabled:' "$ADG_YAML" || true)"
+          echo "AdGuardHome 预置：enabled=${ADG_ENABLED} filters=${ADG_FILTER_N}"
+          if [ "$ADG_ENABLED" != "0" ]; then
+            echo "::error::AdGuardHome 预置 config 的 enabled 不为 0（要求默认不启用）"
+            exit 1
+          fi
+          if [ "$ADG_FILTER_N" != "2" ]; then
+            echo "==================== 预置配置内容校验失败 ===================="
+            echo "定制项       : AdGuardHome DNS 黑名单清单（仅保留 2 条）"
+            echo "来源         : ${PRESET_DIR}/etc/AdGuardHome.yaml"
+            echo "期望值       : filters 条目数 = 2"
+            echo "实际值       : ${ADG_FILTER_N}"
+            echo "可能原因     : preset/etc/AdGuardHome.yaml 的 filters 段被改动。"
+            echo "建议修复方向 : 只保留 https://anti-ad.net/adguard.txt 与"
+            echo "               https://gh-proxy.com/https://raw.githubusercontent.com/2771936993/HG/main/hg1.txt。"
+            echo "==============================================================="
+            echo "::error::AdGuardHome 黑名单清单不符合需求"
+            exit 1
+          fi
+          for CHK in \
+            '    - 114.114.114.114' \
+            '    - 223.5.5.5' \
+            '    url: https://anti-ad.net/adguard.txt' \
+            '    url: https://gh-proxy.com/https://raw.githubusercontent.com/2771936993/HG/main/hg1.txt'; do
+            if ! grep -qF "$CHK" "$ADG_YAML"; then
+              echo "::error::AdGuardHome 预置内容缺失：$CHK"
+              exit 1
+            fi
+          done
+
+          echo "预置配置文件已写入 files/ 覆盖层并通过内容校验："
+          for f in $PRESET_FILES; do
+            printf '  [OK]   files/%s (%s 字节)\n' "$f" "$(stat -c '%s' "$IW/files/$f")"
+          done
+
+          # ---------- 10.5 首次启动 uci-defaults（运行期兜底，幂等） ----------
           mkdir -p "$IW/files/etc/uci-defaults"
           cat > "$IW/files/etc/uci-defaults/99-wrt-x64-defaults" <<UCI
           #!/bin/sh
@@ -749,6 +853,20 @@ jobs:
             uci -q set AdGuardHome.AdGuardHome.binpath='/usr/bin/AdGuardHome'
             uci -q commit AdGuardHome
           }
+          # mwan3：清空接口 / 成员 / 策略，仅保留默认规则（待用户自行配置）
+          # 说明：兼容用户或上游重新引入默认项的情况，逐条删除后再提交。
+          if uci -q get mwan3.globals >/dev/null 2>&1; then
+            for s in \$(uci -q show mwan3 | sed -n "s/^mwan3\.\([^.=]*\)=interface\$/\\1/p"); do
+              uci -q delete "mwan3.\$s"
+            done
+            for s in \$(uci -q show mwan3 | sed -n "s/^mwan3\.\([^.=]*\)=member\$/\\1/p"); do
+              uci -q delete "mwan3.\$s"
+            done
+            for s in \$(uci -q show mwan3 | sed -n "s/^mwan3\.\([^.=]*\)=policy\$/\\1/p"); do
+              uci -q delete "mwan3.\$s"
+            done
+            uci -q commit mwan3
+          fi
           # root 默认密码兜底设置
           echo 'root:${ROOT_PASSWORD}' | chpasswd 2>/dev/null || \
             printf '%s\n%s\n' '${ROOT_PASSWORD}' '${ROOT_PASSWORD}' | passwd root >/dev/null 2>&1

@@ -12,3 +12,6 @@
 *.txt       text eol=lf
 *.md        text eol=lf
 *.json      text eol=lf
+
+# 预置配置文件（部分无扩展名，统一按 LF 归一化）
+preset/**   text eol=lf

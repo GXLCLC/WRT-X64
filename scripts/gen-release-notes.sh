@@ -67,7 +67,7 @@ if [ -n "${MANIFEST:-}" ] && [ -f "$MANIFEST" ]; then
 			sort -u
 	)"
 	# 追加随固件打包的独立程序核心（非 LuCI 插件形态的应用）
-	for core in smartdns ddnsto easytier mwan3 nlbwmon appfilter; do
+	for core in smartdns ddnsto easytier mwan3 nlbwmon appfilter etherwake ttyd; do
 		if grep -q "^${core} - " "$MANIFEST"; then
 			PLUGINS="$(printf '%s\n%s' "$PLUGINS" "$core")"
 		fi
@@ -76,7 +76,7 @@ if [ -n "${MANIFEST:-}" ] && [ -f "$MANIFEST" ]; then
 fi
 
 # ---------- 必选插件落地情况 ----------
-REQUIRED_APPS="luci-app-smartdns luci-app-ddnsto luci-app-adguardhome luci-app-oaf luci-app-turboacc luci-app-mwan3 luci-theme-argon luci-app-argon-config luci-app-nlbwmon luci-app-easytier luci-app-openclash"
+REQUIRED_APPS="luci-app-smartdns luci-app-ddnsto luci-app-adguardhome luci-app-oaf luci-app-turboacc luci-app-mwan3 luci-theme-argon luci-app-argon-config luci-app-nlbwmon luci-app-easytier luci-app-wol luci-app-upnp luci-app-ttyd luci-app-autoreboot"
 CHECK_TABLE=""
 for app in $REQUIRED_APPS; do
 	if [ -n "${MANIFEST:-}" ] && [ -f "$MANIFEST" ] && grep -q "^${app} - " "$MANIFEST"; then
@@ -202,10 +202,14 @@ BUILD_TIME="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 	echo "- AdGuardHome：DNS 级广告过滤，核心已随固件打包（\`/usr/bin/AdGuardHome\`）"
 	echo "- OAF：应用识别与上网行为管控（含 kmod-oaf 内核模块）"
 	echo "- TurboAcc：软件流量分载 + 全锥型 NAT + BBR 拥塞控制（firewall4 适配版）"
-	echo "- Mwan3：多线负载均衡与故障切换"
+	echo "- Mwan3：多线负载均衡与故障切换（默认接口/成员/策略留空，仅保留默认规则，待自行配置）"
 	echo "- nlbwmon：按主机/协议统计的带宽监控"
 	echo "- EasyTier：去中心化异地组网"
-	echo "- OpenClash：代理插件（本固件仅集成此一个代理类插件）"
+	echo "- Wake-on-LAN：网络唤醒（luci-app-wol，底层 etherwake）"
+	echo "- UPnP：端口自动映射（luci-app-upnp + miniupnpd）"
+	echo "- ttyd：网页终端（luci-app-ttyd）"
+	echo "- 定时重启：luci-app-autoreboot"
+	echo "- 已移除 OpenClash，固件不含任何代理类插件"
 	echo "- argon：系统默认 LuCI 主题（含 luci-app-argon-config 外观配置）"
 	echo "- 时区：Asia/Shanghai（CST-8）"
 	echo ""
