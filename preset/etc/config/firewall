@@ -1,0 +1,150 @@
+# ---------------------------------------------------------------------------
+# 本文件由 WRT-X64 云编译工作流预置，整文件覆盖 firewall4 包自带的
+# /etc/config/firewall（该文件位于 openwrt/firewall4 仓库的
+# root/etc/config/firewall）。
+#
+# 为什么需要预置它：
+#   firewall4 上游默认的 config defaults 段只含
+#   syn_flood / input / output / forward / disable_ipv6 五个选项，
+#   并不写 flow_offloading / flow_offloading_hw，fw4 的 ucode 侧默认值
+#   又都是 0（两个开关都不启用）。
+#   X86_64 平台没有硬件 NAT 引擎，硬件流量卸载（flow_offloading_hw）
+#   对该架构完全无效；而软件流量卸载（flow_offloading）由
+#   kmod-nft-offload（nf_flow_table_inet + nft_flow_offload）提供，
+#   对 x86_64 有效且能明显提升路由/NAT 转发性能。
+#
+# 预置内容：
+#   1) config defaults 段显式写入 flow_offloading='1'（软件卸载开）、
+#      flow_offloading_hw='0'（硬件卸载关），LuCI「防火墙 - 一般设置」
+#      的 Routing/NAT Offloading 即显示「Software flow offloading」；
+#   2) 其余 zones / forwarding / rules 与上游默认完全一致，
+#      不改变默认防火墙行为。
+# ---------------------------------------------------------------------------
+
+config defaults
+	option syn_flood	1
+	option input		REJECT
+	option output		ACCEPT
+	option forward		REJECT
+	option flow_offloading	1
+	option flow_offloading_hw	0
+# Uncomment this line to disable ipv6 rules
+#	option disable_ipv6	1
+
+config zone
+	option name		lan
+	list   network		'lan'
+	option input		ACCEPT
+	option output		ACCEPT
+	option forward		ACCEPT
+
+config zone
+	option name		wan
+	list   network		'wan'
+	list   network		'wan6'
+	option input		REJECT
+	option output		ACCEPT
+	option forward		REJECT
+	option masq		1
+	option mtu_fix		1
+
+config forwarding
+	option src		lan
+	option dest		wan
+
+# We need to accept udp packets on port 68,
+# see https://dev.openwrt.org/ticket/4108
+config rule
+	option name		Allow-DHCP-Renew
+	option src		wan
+	option proto		udp
+	option dest_port	68
+	option target		ACCEPT
+	option family		ipv4
+
+# Allow IPv4 ping
+config rule
+	option name		Allow-Ping
+	option src		wan
+	option proto		icmp
+	option icmp_type	echo-request
+	option family		ipv4
+	option target		ACCEPT
+
+config rule
+	option name		Allow-IGMP
+	option src		wan
+	option proto		igmp
+	option family		ipv4
+	option target		ACCEPT
+
+# Allow DHCPv6 replies
+# see https://github.com/openwrt/openwrt/issues/5066
+config rule
+	option name		Allow-DHCPv6
+	option src		wan
+	option proto		udp
+	option dest_port	546
+	option family		ipv6
+	option target		ACCEPT
+
+# Allow MLD
+config rule
+	option name		Allow-MLD
+	option src		wan
+	option proto		icmp
+	option src_ip		fe80::/10
+	list icmp_type		'130/0'
+	list icmp_type		'131/0'
+	list icmp_type		'132/0'
+	list icmp_type		'143/0'
+	option family		ipv6
+	option target		ACCEPT
+
+# Allow essential incoming IPv6 ICMP traffic
+config rule
+	option name		Allow-ICMPv6-Input
+	option src		wan
+	option proto		icmp
+	list icmp_type		echo-request
+	list icmp_type		echo-reply
+	list icmp_type		destination-unreachable
+	list icmp_type		packet-too-big
+	list icmp_type		time-exceeded
+	list icmp_type		bad-header
+	list icmp_type		unknown-header
+	option limit		1000/sec
+	option family		ipv6
+	option target		ACCEPT
+
+# Allow essential forwarded IPv6 ICMP traffic
+config rule
+	option name		Allow-ICMPv6-Forward
+	option src		wan
+	option dest		*
+	option proto		icmp
+	list icmp_type		echo-request
+	list icmp_type		echo-reply
+	list icmp_type		destination-unreachable
+	list icmp_type		packet-too-big
+	list icmp_type		time-exceeded
+	list icmp_type		bad-header
+	list icmp_type		unknown-header
+	option limit		1000/sec
+	option family		ipv6
+	option target		ACCEPT
+
+config rule
+	option name		Allow-IPSec-ESP
+	option src		wan
+	option dest		lan
+	option proto		esp
+	option target		ACCEPT
+
+config rule
+	option name		Allow-ISAKMP
+	option src		wan
+	option dest		lan
+	option dest_port	500
+	option proto		udp
+	option target		ACCEPT

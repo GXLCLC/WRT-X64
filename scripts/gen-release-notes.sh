@@ -76,7 +76,7 @@ if [ -n "${MANIFEST:-}" ] && [ -f "$MANIFEST" ]; then
 fi
 
 # ---------- 必选插件落地情况 ----------
-REQUIRED_APPS="luci-app-smartdns luci-app-ddnsto luci-app-adguardhome luci-app-oaf luci-app-turboacc luci-app-mwan3 luci-theme-argon luci-app-argon-config luci-app-nlbwmon luci-app-easytier luci-app-wol luci-app-upnp luci-app-ttyd luci-app-autoreboot"
+REQUIRED_APPS="luci-app-smartdns luci-app-ddnsto luci-app-adguardhome luci-app-oaf luci-app-turboacc luci-app-mwan3 luci-theme-argon luci-app-argon-config luci-app-nlbwmon luci-app-easytier luci-app-wol luci-app-upnp luci-app-ttyd luci-app-autoreboot luci-app-wechatpush"
 CHECK_TABLE=""
 for app in $REQUIRED_APPS; do
 	if [ -n "${MANIFEST:-}" ] && [ -f "$MANIFEST" ] && grep -q "^${app} - " "$MANIFEST"; then
@@ -209,6 +209,8 @@ BUILD_TIME="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 	echo "- UPnP：端口自动映射（luci-app-upnp + miniupnpd）"
 	echo "- ttyd：网页终端（luci-app-ttyd）"
 	echo "- 定时重启：luci-app-autoreboot"
+	echo "- 微信推送：luci-app-wechatpush（Server酱 / PushPlus / 企业微信 / Telegram / 钉钉 / Bark，推送设备上线下线、IP 变更、登录通知等）"
+	echo "- 防火墙路由/NAT 卸载：默认软件流量卸载（X86_64 无硬件 NAT 引擎，硬件卸载已关闭）"
 	echo "- 已移除 OpenClash，固件不含任何代理类插件"
 	echo "- argon：系统默认 LuCI 主题（含 luci-app-argon-config 外观配置）"
 	echo "- 时区：Asia/Shanghai（CST-8）"

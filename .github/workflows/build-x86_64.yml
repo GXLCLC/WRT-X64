@@ -55,6 +55,8 @@ env:
   KENZOK8_SMALL_BRANCH: main
   DESTAN_OAF: https://github.com/destan19/OpenAppFilter.git
   DESTAN_OAF_BRANCH: master
+  WECHATPUSH_REPO: https://github.com/tty228/luci-app-wechatpush.git
+  WECHATPUSH_BRANCH: master
   TURBOACC_REPO: https://github.com/chenmozhijin/turboacc.git
   TURBOACC_BRANCH: luci
   ADGUARD_VERSION: "0.107.79"
@@ -354,6 +356,26 @@ jobs:
           rm -rf "$IW/package/luci-app-easytier"
           cp -rf "$d/luci-app-easytier" "$IW/package/luci-app-easytier"
 
+          # ---- 7.6 微信推送 luci-app-wechatpush（tty228/luci-app-wechatpush） ----
+          # 支持 Server酱 / PushPlus / 企业微信 / Telegram / 钉钉 / Bark 等推送通道，
+          # 可推送设备上/下线、IP 变更、登录通知、流量与负载信息。
+          # 依赖（Makefile 的 LUCI_DEPENDS）：iputils-arping、curl、jq、bash、
+          #   luci-lua-runtime（本配置已选 luci-compat 提供 Lua 运行时）；
+          # 三个可选子功能（流量监控/磁盘信息/主机信息）默认 n，不引入额外依赖。
+          # 注意：该仓库是「单包仓库」——顶层即 Makefile，root/ htdocs/ po/ 也都在
+          #   仓库根下，没有 luci-app-wechatpush/ 子目录，因此稀疏路径直接写顶层
+          #   目录名；po/zh_Hans/wechatpush.po 用于生成中文语言包
+          #   luci-i18n-wechatpush-zh-cn，必须一并检出。
+          d="$(sparse_pull "luci-app-wechatpush" "${{ env.WECHATPUSH_REPO }}" \
+                "${{ env.WECHATPUSH_BRANCH }}" wechatpush \
+                Makefile po root htdocs \
+                -- Makefile po/zh_Hans/wechatpush.po)"
+          rm -rf "$IW/package/luci-app-wechatpush"
+          mkdir -p "$IW/package/luci-app-wechatpush"
+          # 用 tar 拷贝并排除 .git（cp -rf "src/." 会把 .git 一起带进 package 目录，
+          # 干扰后续 make 的包扫描）
+          tar -C "$d" --exclude=.git -cf - . | tar -C "$IW/package/luci-app-wechatpush" -xf -
+
           echo ""
           echo "==================== 第三方插件落位结果 ===================="
           for p in package/luci-app-adguardhome/Makefile \
@@ -363,7 +385,9 @@ jobs:
                    package/luci-app-oaf/Makefile \
                    package/appfilter/Makefile \
                    package/luci-app-easytier/luci-app-easytier/Makefile \
-                   package/luci-app-easytier/easytier/Makefile; do
+                   package/luci-app-easytier/easytier/Makefile \
+                   package/luci-app-wechatpush/Makefile \
+                   package/luci-app-wechatpush/po/zh_Hans/wechatpush.po; do
             if [ -f "$IW/$p" ]; then
               printf '  [OK]   %s\n' "$p"
             else
@@ -710,11 +734,15 @@ jobs:
           #   prepare_rootfs）会在所有 ipk 安装完成之后，把源码树顶层 files/
           #   目录整体拷贝进 rootfs，因此这里的预置文件优先级高于软件包自带配置。
           #
-          #   - preset/etc/config/mwan3      ：接口/成员/策略全部留空，仅保留 3 条默认规则
-          #   - preset/etc/config/smartdns   ：enabled=0、auto_set_dnsmasq=0、5 个上游服务器
           #   - preset/etc/config/AdGuardHome：enabled=0（默认不启用）
           #   - preset/etc/AdGuardHome.yaml  ：上游 DNS 114.114.114.114/223.5.5.5、
           #                                    黑名单仅保留 anti-ad 与海哥清单两条
+          #   - preset/etc/config/dhcp       ：dnsmasq 段显式写入 option port '53'，
+          #                                    修复 AdGuardHome 重定向模式失效
+          #                                    （其各模式均依赖 uci get dhcp.@dnsmasq[0].port）
+          #   - preset/etc/opkg/distfeeds.conf：opkg 软件源列表，修复「更新列表」失败
+          #                                    （CONFIG_CLEAN_IPKG 开启时上游不再生成该文件）
+          #   - preset/etc/config/firewall   ：默认软件流量卸载（硬件卸载对 X86_64 无效）
           PRESET_DIR="$GITHUB_WORKSPACE/preset"
           if [ ! -d "$PRESET_DIR" ]; then
             echo "==================== 预置配置写入失败 ===================="
@@ -723,8 +751,8 @@ jobs:
             echo "期望路径     : ${PRESET_DIR}"
             echo "实际检测结果 : 目录不存在"
             echo "可能原因     : 检出本仓库时 preset/ 目录缺失（被删除或未被跟踪）。"
-            echo "建议修复方向 : 确认仓库根目录存在 preset/etc/config/{mwan3,smartdns,AdGuardHome}"
-            echo "               与 preset/etc/AdGuardHome.yaml 并重新提交。"
+            echo "建议修复方向 : 确认仓库根目录存在 preset/etc/config/{mwan3,smartdns,AdGuardHome,dhcp,firewall}"
+            echo "               preset/etc/opkg/distfeeds.conf 与 preset/etc/AdGuardHome.yaml 并重新提交。"
             echo "=========================================================="
             echo "::error::未找到 preset/ 目录，无法写入预置配置"
             exit 1
@@ -732,7 +760,7 @@ jobs:
           mkdir -p "$IW/files"
           cp -rf "$PRESET_DIR/." "$IW/files/"
 
-          PRESET_FILES="etc/config/mwan3 etc/config/smartdns etc/config/AdGuardHome etc/AdGuardHome.yaml"
+          PRESET_FILES="etc/config/mwan3 etc/config/smartdns etc/config/AdGuardHome etc/AdGuardHome.yaml etc/config/dhcp etc/opkg/distfeeds.conf etc/config/firewall"
           for f in $PRESET_FILES; do
             if [ ! -s "$IW/files/$f" ]; then
               echo "==================== 预置配置写入失败 ===================="
@@ -832,6 +860,81 @@ jobs:
             fi
           done
 
+          #   dhcp：dnsmasq 段必须显式声明 option port '53'
+          #   （luci-app-adguardhome 的 use_port53 / set_forward_dnsmasq /
+          #     exchange 三种重定向模式全部依赖 uci get dhcp.@dnsmasq[0].port；
+          #     上游 dnsmasq 包自带的 dhcp.conf 与 odhcpd.defaults 均不写该选项，
+          #     取空值会导致三种模式全部失效，故必须在此校验。）
+          DHCP_F="$IW/files/etc/config/dhcp"
+          DHCP_PORT_N="$(grep -cE "^[[:space:]]*option[[:space:]]+port[[:space:]]+'?53'?[[:space:]]*$" "$DHCP_F" || true)"
+          DHCP_CFG_N="$(grep -cE "^config[[:space:]]+dnsmasq" "$DHCP_F" || true)"
+          echo "dhcp 预置：dnsmasq 段=${DHCP_CFG_N} port=53 声明数=${DHCP_PORT_N}"
+          if [ "$DHCP_CFG_N" != "1" ] || [ "$DHCP_PORT_N" != "1" ]; then
+            echo "==================== 预置配置内容校验失败 ===================="
+            echo "定制项       : dnsmasq DNS 端口基准（修复 AdGuardHome 重定向失效）"
+            echo "来源         : ${PRESET_DIR}/etc/config/dhcp"
+            echo "期望值       : config dnsmasq 段 = 1 且 option port '53' 声明 = 1"
+            echo "实际值       : dnsmasq 段=${DHCP_CFG_N} port=53 声明数=${DHCP_PORT_N}"
+            echo "可能原因     : preset/etc/config/dhcp 被改动，port 选项丢失或写错。"
+            echo "建议修复方向 : 在 config dnsmasq 段内补回 option port '53'。"
+            echo "==============================================================="
+            echo "::error::dhcp 预置配置缺少 dnsmasq 端口声明"
+            exit 1
+          fi
+
+          #   opkg 软件源：必须包含 core/base/luci/packages/routing/telephony 六个源，
+          #   且 URL 必须指向 downloads.immortalwrt.org 的 24.10 发布目录
+          FEEDS_F="$IW/files/etc/opkg/distfeeds.conf"
+          FEEDS_N="$(grep -cE '^[[:space:]]*src/gz[[:space:]]' "$FEEDS_F" || true)"
+          echo "opkg distfeeds 预置：src/gz 源数量=${FEEDS_N}"
+          if [ "$FEEDS_N" != "6" ]; then
+            echo "==================== 预置配置内容校验失败 ===================="
+            echo "定制项       : opkg 软件源列表（修复 LuCI 更新列表失败）"
+            echo "来源         : ${PRESET_DIR}/etc/opkg/distfeeds.conf"
+            echo "期望值       : src/gz 源数量 = 6（core/base/luci/packages/routing/telephony）"
+            echo "实际值       : ${FEEDS_N}"
+            echo "可能原因     : preset/etc/opkg/distfeeds.conf 被改动，源条目增减或被注释。"
+            echo "建议修复方向 : 保持 6 条 src/gz 行，URL 指向"
+            echo "               https://downloads.immortalwrt.org/releases/24.10.0/... 。"
+            echo "==============================================================="
+            echo "::error::opkg distfeeds 预置配置源数量不符"
+            exit 1
+          fi
+          for FEED in \
+            'src/gz immortalwrt_core https://downloads.immortalwrt.org/releases/24.10.0/targets/x86/64/packages' \
+            'src/gz immortalwrt_base https://downloads.immortalwrt.org/releases/24.10.0/packages/x86_64/base' \
+            'src/gz immortalwrt_luci https://downloads.immortalwrt.org/releases/24.10.0/packages/x86_64/luci' \
+            'src/gz immortalwrt_packages https://downloads.immortalwrt.org/releases/24.10.0/packages/x86_64/packages' \
+            'src/gz immortalwrt_routing https://downloads.immortalwrt.org/releases/24.10.0/packages/x86_64/routing' \
+            'src/gz immortalwrt_telephony https://downloads.immortalwrt.org/releases/24.10.0/packages/x86_64/telephony'; do
+            if ! grep -qF "$FEED" "$FEEDS_F"; then
+              echo "::error::opkg distfeeds 预置内容缺失：$FEED"
+              exit 1
+            fi
+          done
+
+          #   firewall：config defaults 段必须显式声明
+          #     flow_offloading='1'（软件流量卸载）与 flow_offloading_hw='0'（硬件卸载关）
+          #   （firewall4 上游默认两个开关均不写、fw4 ucode 侧默认值也为 0；
+          #     X86_64 无硬件 NAT 引擎，必须默认走软件卸载。）
+          FW_F="$IW/files/etc/config/firewall"
+          FW_SW="$(sed -n "s/^[[:space:]]*option[[:space:]]\+flow_offloading[[:space:]]\+'\{0,1\}\([01]\)'\{0,1\}[[:space:]]*$/\\1/p" "$FW_F" | head -1)"
+          FW_HW="$(sed -n "s/^[[:space:]]*option[[:space:]]\+flow_offloading_hw[[:space:]]\+'\{0,1\}\([01]\)'\{0,1\}[[:space:]]*$/\\1/p" "$FW_F" | head -1)"
+          echo "firewall 预置：flow_offloading=${FW_SW} flow_offloading_hw=${FW_HW}"
+          if [ "$FW_SW" != "1" ] || [ "$FW_HW" != "0" ]; then
+            echo "==================== 预置配置内容校验失败 ===================="
+            echo "定制项       : 防火墙路由/NAT 卸载默认值（软件卸载）"
+            echo "来源         : ${PRESET_DIR}/etc/config/firewall"
+            echo "期望值       : flow_offloading=1（软件卸载） flow_offloading_hw=0（硬件卸载关）"
+            echo "实际值       : flow_offloading=${FW_SW} flow_offloading_hw=${FW_HW}"
+            echo "可能原因     : preset/etc/config/firewall 被改动，或 defaults 段丢失这两个选项。"
+            echo "建议修复方向 : 在 config defaults 段内补回 option flow_offloading '1'"
+            echo "               与 option flow_offloading_hw '0'。"
+            echo "==============================================================="
+            echo "::error::firewall 预置配置未默认软件流量卸载"
+            exit 1
+          fi
+
           echo "预置配置文件已写入 files/ 覆盖层并通过内容校验："
           for f in $PRESET_FILES; do
             printf '  [OK]   files/%s (%s 字节)\n' "$f" "$(stat -c '%s' "$IW/files/$f")"
@@ -853,6 +956,62 @@ jobs:
             uci -q set AdGuardHome.AdGuardHome.binpath='/usr/bin/AdGuardHome'
             uci -q commit AdGuardHome
           }
+          # AdGuardHome 重定向状态机初始化：
+          #   init 脚本（/etc/init.d/AdGuardHome 的 _do_redirect）用 old_redirect /
+          #   old_port / old_enabled 三个"上一次生效值"与当前值比对来决定是否执行
+          #   清理 / 应用动作。首次启动这三项不存在时 config_get 会取默认值
+          #   "none"/"0"/"0"，与用户真实配置不一致会导致模式判断错乱，
+          #   因此首次启动时显式初始化为与 preset 一致的值。
+          if uci -q get AdGuardHome.AdGuardHome >/dev/null 2>&1; then
+            AGH_REDIR="$(uci -q get AdGuardHome.AdGuardHome.redirect || echo none)"
+            AGH_EN="$(uci -q get AdGuardHome.AdGuardHome.enabled || echo 0)"
+            AGH_PORT="$(sed -n "s/^[[:space:]]*port:[[:space:]]*//p" /etc/AdGuardHome.yaml 2>/dev/null | head -1)"
+            [ -n "\$AGH_PORT" ] || AGH_PORT='5553'
+            uci -q delete AdGuardHome.AdGuardHome.old_redirect >/dev/null 2>&1
+            uci -q delete AdGuardHome.AdGuardHome.old_port >/dev/null 2>&1
+            uci -q delete AdGuardHome.AdGuardHome.old_enabled >/dev/null 2>&1
+            uci -q add_list AdGuardHome.AdGuardHome.old_redirect="\$AGH_REDIR"
+            uci -q add_list AdGuardHome.AdGuardHome.old_port="\$AGH_PORT"
+            uci -q add_list AdGuardHome.AdGuardHome.old_enabled="\$AGH_EN"
+            uci -q commit AdGuardHome
+          fi
+          # dnsmasq DNS 端口基准值：
+          #   preset/etc/config/dhcp 已显式写入 option port '53'，
+          #   此处再兜底一次，保证 uci get dhcp.@dnsmasq[0].port 恒有值可读
+          #   （luci-app-adguardhome 的 use_port53 / set_forward_dnsmasq /
+          #    exchange 模式判断全部依赖该值）。
+          if uci -q get dhcp.@dnsmasq[0] >/dev/null 2>&1; then
+            uci -q set dhcp.@dnsmasq[0].port='53'
+            uci -q commit dhcp
+          fi
+          # 防火墙路由/NAT 卸载默认改为「软件流量卸载」：
+          #   X86_64 平台没有硬件 NAT 引擎，硬件流量卸载（flow_offloading_hw）
+          #   对该架构无效；fw4 上游默认两个开关均为 0（不启用），
+          #   这里显式写为软件卸载开、硬件卸载关，LuCI「防火墙 - 一般设置」
+          #   的「Routing/NAT Offloading」即显示「Software flow offloading」。
+          #   kmod-nft-offload 已由 firewall4 的 DEPENDS 与
+          #   config/required-packages.txt 保证随固件打包。
+          if uci -q get firewall.@defaults[0] >/dev/null 2>&1; then
+            uci -q set firewall.@defaults[0].flow_offloading='1'
+            uci -q set firewall.@defaults[0].flow_offloading_hw='0'
+            uci -q commit firewall
+          fi
+          # opkg 软件源列表兜底：
+          #   正常流程由 base-files 的 FeedSourcesAppendOPKG 在镜像打包时
+          #   写入 /etc/opkg/distfeeds.conf；若该文件缺失或为空，
+          #   「软件包 - 更新列表」会因无任何可用源而失败。
+          #   这里按当前 24.10 官方源结构重建，保证首次开机即可更新列表。
+          if [ ! -s /etc/opkg/distfeeds.conf ]; then
+            mkdir -p /etc/opkg
+            cat > /etc/opkg/distfeeds.conf <<'FEEDS'
+          src/gz immortalwrt_core https://downloads.immortalwrt.org/releases/24.10.0/targets/x86/64/packages
+          src/gz immortalwrt_base https://downloads.immortalwrt.org/releases/24.10.0/packages/x86_64/base
+          src/gz immortalwrt_luci https://downloads.immortalwrt.org/releases/24.10.0/packages/x86_64/luci
+          src/gz immortalwrt_packages https://downloads.immortalwrt.org/releases/24.10.0/packages/x86_64/packages
+          src/gz immortalwrt_routing https://downloads.immortalwrt.org/releases/24.10.0/packages/x86_64/routing
+          src/gz immortalwrt_telephony https://downloads.immortalwrt.org/releases/24.10.0/packages/x86_64/telephony
+          FEEDS
+          fi
           # mwan3：清空接口 / 成员 / 策略，仅保留默认规则（待用户自行配置）
           # 说明：兼容用户或上游重新引入默认项的情况，逐条删除后再提交。
           if uci -q get mwan3.globals >/dev/null 2>&1; then

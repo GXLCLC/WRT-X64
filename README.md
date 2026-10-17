@@ -47,7 +47,7 @@ dd if=immortalwrt-x86-64-generic-squashfs-combined.img of=/dev/sdX bs=4M conv=fs
 | 穿透 | DDNSTO 内网穿透（中文） |
 | 加速 | TurboAcc（firewall4 适配版：软件流量分载 + 全锥型 NAT + BBR） |
 | 网络功能 | Mwan3 多拨、nlbwmon 带宽监控、EasyTier 去中心化组网、UPnP 端口自动映射、网络唤醒（WOL） |
-| 运维工具 | ttyd 网页终端、定时重启（autoreboot） |
+| 运维工具 | ttyd 网页终端、定时重启（autoreboot）、微信推送（wechatpush） |
 | 应用过滤 | OAF（`kmod-oaf` 内核模块 + `appfilter` 用户态服务 + LuCI 面板） |
 | 驱动 | USB 控制器/存储/HID/串口、USB 网卡（asix、rtl8150、rtl8152-vendor、cdc-ether 等）、Intel / Realtek / 其它常见有线网卡 |
 | 语言 | 所有自带语言包的插件均已勾选 `zh-cn` 中文语言包 |
@@ -58,9 +58,9 @@ dd if=immortalwrt-x86-64-generic-squashfs-combined.img of=/dev/sdX bs=4M conv=fs
 
 ## 预置配置
 
-除「选中哪些软件包」之外，mwan3 / SmartDNS / AdGuardHome 的**默认配置文件**由仓库
-`preset/` 目录整文件覆盖，随固件一起打包（利用 buildroot 在打包阶段后于 ipk 安装
-拷贝源码树顶层 `files/` 的机制，优先级高于软件包自带配置）：
+除「选中哪些软件包」之外，mwan3 / SmartDNS / AdGuardHome / dhcp / firewall / opkg 的
+**默认配置文件**由仓库 `preset/` 目录整文件覆盖，随固件一起打包（利用 buildroot 在打包
+阶段后于 ipk 安装拷贝源码树顶层 `files/` 的机制，优先级高于软件包自带配置）：
 
 | 文件 | 预置内容 |
 | --- | --- |
@@ -68,12 +68,21 @@ dd if=immortalwrt-x86-64-generic-squashfs-combined.img of=/dev/sdX bs=4M conv=fs
 | `preset/etc/config/smartdns` | `enabled=0`（不启用）、`auto_set_dnsmasq=0`（不自动设置 dnsmasq）；预写入 5 个上游服务器：`114.114.114.114`（114DNS）、`223.5.5.5`（阿里DNS）、`180.184.1.1`（字节跳动）、`119.29.29.29`（腾讯DNS）、`8.8.8.8`（谷歌DNS），协议类型均为 **UDP**，端口留空不填 |
 | `preset/etc/config/AdGuardHome` | `enabled=0`，AdGuardHome **默认不启用**，需用户手动启用 |
 | `preset/etc/AdGuardHome.yaml` | 上游 DNS 预填 `114.114.114.114` 与 `223.5.5.5`；DNS 黑名单清单**只保留两条**：`https://anti-ad.net/adguard.txt`（AD 命中率最高列表）、`https://gh-proxy.com/https://raw.githubusercontent.com/2771936993/HG/main/hg1.txt`（海哥的清单） |
+| `preset/etc/config/dhcp` | dnsmasq 段显式写入 `option port '53'`。**这是修复 AdGuardHome 重定向模式失效的关键**：`luci-app-adguardhome` 的 `use_port53()` / `set_forward_dnsmasq()` / `exchange` 三种重定向模式全部依赖 `uci get dhcp.@dnsmasq[0].port`，而上游 `dhcp.conf` 与 `odhcpd.defaults` 均不写该选项，取空值会导致三种模式全部失效（界面显示「未定向」、后台无查询/拦截信息） |
+| `preset/etc/config/firewall` | `config defaults` 段显式写入 `flow_offloading='1'`（**软件流量卸载**）、`flow_offloading_hw='0'`（硬件卸载关闭）。X86_64 平台没有硬件 NAT 引擎，硬件流量卸载对该架构无效，故默认走软件卸载（由 `kmod-nft-offload` 提供） |
+| `preset/etc/opkg/distfeeds.conf` | opkg 软件源列表（core / base / luci / packages / routing / telephony 六个源）。修复 LuCI「软件包 - 更新列表」失败问题——当 `CONFIG_CLEAN_IPKG` 开启时上游 `base-files` 不再生成该文件，固件会因无任何可用源而无法更新列表 |
 
 工作流在写入后会对上述内容做结构化校验（mwan3 段落计数、SmartDNS 开关与 5 个上游、
-AdGuardHome 黑名单条目数），不符合需求立即终止。
+AdGuardHome 黑名单条目数、dhcp 的 `port '53'` 声明、firewall 的两个 offloading 开关、
+opkg 六源完整性与 URL），不符合需求立即终止。
 
 > 若用户或上游重新引入 mwan3 默认接口，首次启动的 `99-wrt-x64-defaults` 兜底脚本
 > 仍会删除接口 / 成员 / 策略段并提交一次，保证「留空」状态。
+>
+> 同一脚本还会在首次启动时补齐 AdGuardHome 的 `old_redirect` / `old_port` /
+> `old_enabled` 三个状态标志（init 脚本用它们与当前配置比对来决定是否执行重定向），
+> 并再次确保 `dhcp.@dnsmasq[0].port='53'`、`flow_offloading='1'` /
+> `flow_offloading_hw='0'`，以及 `/etc/opkg/distfeeds.conf` 非空。
 
 ## 默认参数
 
@@ -96,6 +105,9 @@ preset/etc/config/mwan3              mwan3 预置配置（接口/成员/策略�
 preset/etc/config/smartdns           SmartDNS 预置配置（不启用 + 5 个上游服务器）
 preset/etc/config/AdGuardHome        AdGuardHome 预置配置（默认不启用）
 preset/etc/AdGuardHome.yaml          AdGuardHome 预置 YAML（上游 DNS + 黑名单清单）
+preset/etc/config/dhcp               dnsmasq 预置配置（显式 port '53'，修复 AGH 重定向）
+preset/etc/config/firewall           防火墙预置配置（默认软件流量卸载）
+preset/etc/opkg/distfeeds.conf       opkg 软件源列表（修复更新列表失败）
 scripts/check-packages.sh            必选包校验（config / manifest 两种模式）
 scripts/verify-artifacts.sh          产物校验（存在性/命名/格式/分区/插件完整性）
 scripts/gen-release-notes.sh         Release 说明生成
@@ -123,7 +135,7 @@ scripts/gen-release-notes.sh         Release 说明生成
 | 拉取源码 | 上游分支可达性（`git ls-remote`），分支不存在立即终止 |
 | 拉取第三方插件 | 分支可达性 + 稀疏检出 + 目标路径存在性 + 落位结果汇总 |
 | 集成 TurboAcc | 内核版本支持范围（5.10/5.15/6.1/6.6/6.12/6.18）+ 官方脚本落位校验 + **952 补丁唯一性**（移除 turboacc 注入的重复补丁，避免与 ImmortalWrt 原生 952 补丁冲突） |
-| 预置配置 | `preset/` 四个文件落位校验 + 内容结构化校验（mwan3 段落计数 = 0/0/0 且规则 = 3；SmartDNS `enabled=0`/`auto_set_dnsmasq=0`/5 个上游且全为 udp、无 port；AdGuardHome `enabled=0`、黑名单恰好 2 条指定链接） |
+| 预置配置 | `preset/` 七个文件落位校验 + 内容结构化校验（mwan3 段落计数 = 0/0/0 且规则 = 3；SmartDNS `enabled=0`/`auto_set_dnsmasq=0`/5 个上游且全为 udp、无 port；AdGuardHome `enabled=0`、黑名单恰好 2 条指定链接；dhcp 的 `config dnsmasq` 段含 `option port '53'`；firewall 的 `flow_offloading=1`/`flow_offloading_hw=0`；opkg 恰好 6 个 `src/gz` 源且 URL 指向 24.10 发布目录） |
 | 编译前 | `make defconfig` 后必选包解析校验；`make download` 后 0 字节下载文件校验（自动排除 cargo 在 `dl/cargo` 下创建的 `.package-cache` 等天然为空的隐藏锁标记文件，避免误判） |
 | 编译后 | 产物存在性、命名唯一性、MBR 分区表、rootfs 2048 MiB、squashfs 魔数、manifest 插件完整性、AdGuardHome 核心存在 |
 | 压缩发布 | 压缩前磁盘空间充足性 + 压缩产物体积 < 2 GiB（Release 单文件上限），两道校验在步骤 18 与步骤 22 各执行一次 |
@@ -139,6 +151,7 @@ scripts/gen-release-notes.sh         Release 说明生成
 | kmod-oaf / luci-app-oaf | [kenzok8/small-package](https://github.com/kenzok8/small-package) @ main | 稀疏浅克隆 |
 | appfilter（OAF 用户态） | [destan19/OpenAppFilter](https://github.com/destan19/OpenAppFilter) @ master | 稀疏浅克隆 `open-app-filter` |
 | easytier / luci-app-easytier | [kenzok8/small-package](https://github.com/kenzok8/small-package) @ main | 稀疏浅克隆容器目录 |
+| luci-app-wechatpush | [tty228/luci-app-wechatpush](https://github.com/tty228/luci-app-wechatpush) @ master | 稀疏浅克隆（Makefile + `po/zh_Hans` 中文语言包） |
 | TurboAcc | [chenmozhijin/turboacc](https://github.com/chenmozhijin/turboacc) @ luci | 官方 `add_turboacc.sh` 集成 |
 
 均只拉取所需子目录，不整仓库拉取。
