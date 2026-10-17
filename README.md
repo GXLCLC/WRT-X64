@@ -83,6 +83,11 @@ opkg 六源完整性与 URL），不符合需求立即终止。
 > `old_enabled` 三个状态标志（init 脚本用它们与当前配置比对来决定是否执行重定向），
 > 并再次确保 `dhcp.@dnsmasq[0].port='53'`、`flow_offloading='1'` /
 > `flow_offloading_hw='0'`，以及 `/etc/opkg/distfeeds.conf` 非空。
+>
+> 该兜底脚本由 `scripts/write-uci-defaults.sh` 生成（工作流步骤 10.5 调用）。
+> 之所以抽成独立脚本：GitHub Actions 对单个 `run` 步骤有 21000 字符的硬上限，
+> 内联写法超出后工作流无法被 GitHub 解析（三次运行均以 `startup_failure` 秒挂）。
+> 脚本内部自带语法校验与关键定制项复核，生成失败同样立即终止。
 
 ## 默认参数
 
@@ -111,6 +116,7 @@ preset/etc/opkg/distfeeds.conf       opkg 软件源列表（修复更新列表�
 scripts/check-packages.sh            必选包校验（config / manifest 两种模式）
 scripts/verify-artifacts.sh          产物校验（存在性/命名/格式/分区/插件完整性）
 scripts/gen-release-notes.sh         Release 说明生成
+scripts/write-uci-defaults.sh        生成首次启动兜底脚本 99-wrt-x64-defaults（时区/AGH 状态机/dhcp port/防火墙卸载/opkg 源/mwan3/root 密码）
 ```
 
 ### 如何增减插件
