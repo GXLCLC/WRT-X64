@@ -1,0 +1,30 @@
+# ---------------------------------------------------------------------------
+# 本文件由 WRT-X64 云编译工作流预置，整文件覆盖 luci-theme-argon / 
+# luci-app-argon-config 包自带的 /etc/config/argon。
+#
+# 目的：让登录后台界面展示 Bing 的每日图片作为背景。
+#
+# 根因说明：
+#   jerrykuku/luci-theme-argon 基础主题自带的 root/etc/config/argon 默认
+#   写的是 option online_wallpaper 'none'（不显示在线壁纸）。
+#   而 luci-app-argon-config 自带的同一文件默认写的是 'bing'。
+#   由于 base-files 的 prepare_rootfs 只在「包安装」阶段拷贝，而两个包都
+#   带同名文件，最终落到固件里的默认值取决于包的安装顺序——实测基础主题
+#   的 'none' 覆盖了 argon-config 的 'bing'，导致登录界面不显示 Bing 图片。
+#
+#   这里整文件覆盖为 'bing'，并保留 argon-config 的其它配色默认值，
+#   保证「登录界面 - 在线壁纸 = Bing 每日图片」确定性生效。
+# ---------------------------------------------------------------------------
+
+config global
+	option login_style 'classic'
+	option primary '#5e72e4'
+	option dark_primary '#483d8b'
+	option dark_primary_mode 'auto'
+	option dark_glass_mode 'inherit'
+	option blur '10'
+	option blur_dark '10'
+	option transparency '0.5'
+	option transparency_dark '0.5'
+	option mode 'normal'
+	option online_wallpaper 'bing'

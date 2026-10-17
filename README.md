@@ -108,10 +108,11 @@ config/X86_64.config                 固件配置基线，增减插件改这里
 config/required-packages.txt         必选软件包清单（编译前后双重校验）
 preset/etc/config/mwan3              mwan3 预置配置（接口/成员/策略留空）
 preset/etc/config/smartdns           SmartDNS 预置配置（不启用 + 5 个上游服务器）
-preset/etc/config/AdGuardHome        AdGuardHome 预置配置（默认不启用）
+preset/etc/config/AdGuardHome        AdGuardHome 预置配置（默认开机自启，redirect=none）
 preset/etc/AdGuardHome.yaml          AdGuardHome 预置 YAML（上游 DNS + 黑名单清单）
 preset/etc/config/dhcp               dnsmasq 预置配置（显式 port '53'，修复 AGH 重定向）
-preset/etc/config/firewall           防火墙预置配置（默认软件流量卸载）
+preset/etc/config/firewall           防火墙预置配置（软件流量卸载 + 全锥 NAT）
+preset/etc/config/argon              argon 主题预置配置（登录界面展示 Bing 每日图片）
 preset/etc/opkg/distfeeds.conf       opkg 软件源列表（修复更新列表失败）
 scripts/check-packages.sh            必选包校验（config / manifest 两种模式）
 scripts/verify-artifacts.sh          产物校验（存在性/命名/格式/分区/插件完整性）
@@ -141,7 +142,7 @@ scripts/write-uci-defaults.sh        生成首次启动兜底脚本 99-wrt-x64-d
 | 拉取源码 | 上游分支可达性（`git ls-remote`），分支不存在立即终止 |
 | 拉取第三方插件 | 分支可达性 + 稀疏检出 + 目标路径存在性 + 落位结果汇总 |
 | 集成 TurboAcc | 内核版本支持范围（5.10/5.15/6.1/6.6/6.12/6.18）+ 官方脚本落位校验 + **952 补丁唯一性**（移除 turboacc 注入的重复补丁，避免与 ImmortalWrt 原生 952 补丁冲突） |
-| 预置配置 | `preset/` 七个文件落位校验 + 内容结构化校验（mwan3 段落计数 = 0/0/0 且规则 = 3；SmartDNS `enabled=0`/`auto_set_dnsmasq=0`/5 个上游且全为 udp、无 port；AdGuardHome `enabled=0`、黑名单恰好 2 条指定链接；dhcp 的 `config dnsmasq` 段含 `option port '53'`；firewall 的 `flow_offloading=1`/`flow_offloading_hw=0`；opkg 恰好 6 个 `src/gz` 源且 URL 指向 24.10 发布目录） |
+| 预置配置 | `preset/` 八个文件落位校验 + 内容结构化校验（mwan3 段落计数 = 0/0/0 且规则 = 3；SmartDNS `enabled=0`/`auto_set_dnsmasq=0`/5 个上游且全为 udp、无 port；AdGuardHome `enabled=1`、黑名单恰好 2 条指定链接、redirect=none；dhcp 的 `config dnsmasq` 段含 `option port '53'`；firewall 的 `flow_offloading=1`/`flow_offloading_hw=0`/`fullcone=1`；argon 的 `online_wallpaper=bing`；opkg 恰好 6 个 `src/gz` 源且 URL 指向 24.10 发布目录） |
 | 编译前 | `make defconfig` 后必选包解析校验；`make download` 后 0 字节下载文件校验（自动排除 cargo 在 `dl/cargo` 下创建的 `.package-cache` 等天然为空的隐藏锁标记文件，避免误判） |
 | 编译后 | 产物存在性、命名唯一性、MBR 分区表、rootfs 2048 MiB、squashfs 魔数、manifest 插件完整性、AdGuardHome 核心存在 |
 | 压缩发布 | 压缩前磁盘空间充足性 + 压缩产物体积 < 2 GiB（Release 单文件上限），两道校验在步骤 18 与步骤 22 各执行一次 |

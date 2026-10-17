@@ -17,8 +17,20 @@
 #   1) config defaults 段显式写入 flow_offloading='1'（软件卸载开）、
 #      flow_offloading_hw='0'（硬件卸载关），LuCI「防火墙 - 一般设置」
 #      的 Routing/NAT Offloading 即显示「Software flow offloading」；
-#   2) 其余 zones / forwarding / rules 与上游默认完全一致，
+#   2) config defaults 段显式写入 fullcone='1'（全锥形 NAT 开），
+#      配合 TurboAcc 的 nft-fullcone 内核模块（kmod-nft-fullcone）实现
+#      全锥形 NAT。注意：TurboAcc 自带 /etc/config/turboacc 默认
+#      fullcone_nat='1'，开机 init 脚本会把 firewall.@defaults[0].fullcone
+#      写为 1，因此这里再显式写一次作为确定性兜底；
+#   3) 其余 zones / forwarding / rules 与上游默认完全一致，
 #      不改变默认防火墙行为。
+#
+# 重要（历史坑）：TurboAcc 自带 /etc/config/turboacc 默认 hw_flow='1'，
+#   其开机 init 脚本（/etc/init.d/turboacc）会把
+#   firewall.@defaults[0].flow_offloading_hw 写回 1，覆盖本文件的 0。
+#   因此软件流量卸载的「硬件卸载关」必须在首次启动兜底脚本
+#   scripts/write-uci-defaults.sh 的 99-wrt-x64-defaults 里再次强制
+#   写回 flow_offloading_hw='0'，才能彻底生效。
 # ---------------------------------------------------------------------------
 
 config defaults
@@ -28,6 +40,7 @@ config defaults
 	option forward		REJECT
 	option flow_offloading	1
 	option flow_offloading_hw	0
+	option fullcone	1
 # Uncomment this line to disable ipv6 rules
 #	option disable_ipv6	1
 

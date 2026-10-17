@@ -99,17 +99,30 @@ if uci -q get dhcp.@dnsmasq[0] >/dev/null 2>&1; then
   uci -q set dhcp.@dnsmasq[0].port='53'
   uci -q commit dhcp
 fi
-# 防火墙路由/NAT 卸载默认改为「软件流量卸载」：
+# 防火墙路由/NAT 卸载默认改为「软件流量卸载」+ 全锥形 NAT：
 #   X86_64 平台没有硬件 NAT 引擎，硬件流量卸载（flow_offloading_hw）
 #   对该架构无效；fw4 上游默认两个开关均为 0（不启用），
 #   这里显式写为软件卸载开、硬件卸载关，LuCI「防火墙 - 一般设置」
 #   的「Routing/NAT Offloading」即显示「Software flow offloading」。
 #   kmod-nft-offload 已由 firewall4 的 DEPENDS 与
 #   config/required-packages.txt 保证随固件打包。
+#   注意：TurboAcc 的 /etc/init.d/turboacc 开机时会把
+#   firewall.@defaults[0].flow_offloading_hw 写回其配置值（默认 1），
+#   因此必须在「首次启动兜底」脚本里再次强制写回 0，才能彻底覆盖它；
+#   全锥型 NAT（fullcone=1）同理，TurboAcc 开机也会写入，这里再写一次兜底。
 if uci -q get firewall.@defaults[0] >/dev/null 2>&1; then
   uci -q set firewall.@defaults[0].flow_offloading='1'
   uci -q set firewall.@defaults[0].flow_offloading_hw='0'
+  uci -q set firewall.@defaults[0].fullcone='1'
   uci -q commit firewall
+fi
+# argon 主题登录界面展示 Bing 每日图片：
+#   luci-theme-argon 基础主题自带的 /etc/config/argon 默认
+#   online_wallpaper='none'，会覆盖 luci-app-argon-config 的 'bing'，
+#   导致登录界面不显示 Bing 图片。这里显式写回 'bing' 作为兜底。
+if uci -q get argon.@global[0] >/dev/null 2>&1; then
+  uci -q set argon.@global[0].online_wallpaper='bing'
+  uci -q commit argon
 fi
 # opkg 软件源列表兜底：
 #   正常流程由 base-files 的 FeedSourcesAppendOPKG 在镜像打包时
@@ -169,6 +182,7 @@ for check in "timezone='CST-8'" "zonename='Asia/Shanghai'" \
 	"old_redirect" "old_port" "old_enabled" \
 	"dhcp.@dnsmasq[0].port='53'" \
 	"flow_offloading='1'" "flow_offloading_hw='0'" \
+	"fullcone='1'" "online_wallpaper='bing'" \
 	"src/gz immortalwrt_core" "mwan3"; do
 	if ! grep -qF "$check" "$OUT_FILE"; then
 		echo "::error::uci-defaults 脚本缺少关键定制项：$check"

@@ -734,7 +734,7 @@ jobs:
           #   prepare_rootfs）会在所有 ipk 安装完成之后，把源码树顶层 files/
           #   目录整体拷贝进 rootfs，因此这里的预置文件优先级高于软件包自带配置。
           #
-          #   - preset/etc/config/AdGuardHome：enabled=0（默认不启用）
+          #   - preset/etc/config/AdGuardHome：enabled=1（默认开机自启，核心已打包，Web 后台可直接访问）、redirect=none（重定向模式由用户手动选）
           #   - preset/etc/AdGuardHome.yaml  ：上游 DNS 114.114.114.114/223.5.5.5、
           #                                    黑名单仅保留 anti-ad 与海哥清单两条
           #   - preset/etc/config/dhcp       ：dnsmasq 段显式写入 option port '53'，
@@ -742,7 +742,8 @@ jobs:
           #                                    （其各模式均依赖 uci get dhcp.@dnsmasq[0].port）
           #   - preset/etc/opkg/distfeeds.conf：opkg 软件源列表，修复「更新列表」失败
           #                                    （CONFIG_CLEAN_IPKG 开启时上游不再生成该文件）
-          #   - preset/etc/config/firewall   ：默认软件流量卸载（硬件卸载对 X86_64 无效）
+          #   - preset/etc/config/firewall   ：默认软件流量卸载（硬件卸载对 X86_64 无效）+ 全锥 NAT
+          #   - preset/etc/config/argon      ：登录界面展示 Bing 每日图片（覆盖基础主题默认的 none）
           PRESET_DIR="$GITHUB_WORKSPACE/preset"
           if [ ! -d "$PRESET_DIR" ]; then
             echo "==================== 预置配置写入失败 ===================="
@@ -760,7 +761,7 @@ jobs:
           mkdir -p "$IW/files"
           cp -rf "$PRESET_DIR/." "$IW/files/"
 
-          PRESET_FILES="etc/config/mwan3 etc/config/smartdns etc/config/AdGuardHome etc/AdGuardHome.yaml etc/config/dhcp etc/opkg/distfeeds.conf etc/config/firewall"
+          PRESET_FILES="etc/config/mwan3 etc/config/smartdns etc/config/AdGuardHome etc/AdGuardHome.yaml etc/config/dhcp etc/opkg/distfeeds.conf etc/config/firewall etc/config/argon"
           for f in $PRESET_FILES; do
             if [ ! -s "$IW/files/$f" ]; then
               echo "==================== 预置配置写入失败 ===================="
@@ -826,14 +827,21 @@ jobs:
             fi
           done
 
-          #   AdGuardHome：UCI 内不启用；YAML 内上游 DNS 两项、黑名单恰好两条指定链接
+          #   AdGuardHome：UCI 内默认开机自启（enabled=1，核心已打包、Web 后台可直接访问）；
+          #   redirect 保持 none（用户需在 LuCI 中手动勾选重定向模式）；
+          #   YAML 内上游 DNS 两项、黑名单恰好两条指定链接
           ADG_CFG="$IW/files/etc/config/AdGuardHome"
           ADG_ENABLED="$(sed -n "s/^[[:space:]]*option enabled '\\([01]\\)'.*/\\1/p" "$ADG_CFG" | head -1)"
+          ADG_REDIR="$(sed -n "s/^[[:space:]]*option redirect '\\([a-z]*\\)'.*/\\1/p" "$ADG_CFG" | head -1)"
           ADG_YAML="$IW/files/etc/AdGuardHome.yaml"
           ADG_FILTER_N="$(grep -cE '^[[:space:]]+-[[:space:]]+enabled:' "$ADG_YAML" || true)"
-          echo "AdGuardHome 预置：enabled=${ADG_ENABLED} filters=${ADG_FILTER_N}"
-          if [ "$ADG_ENABLED" != "0" ]; then
-            echo "::error::AdGuardHome 预置 config 的 enabled 不为 0（要求默认不启用）"
+          echo "AdGuardHome 预置：enabled=${ADG_ENABLED} redirect=${ADG_REDIR} filters=${ADG_FILTER_N}"
+          if [ "$ADG_ENABLED" != "1" ]; then
+            echo "::error::AdGuardHome 预置 config 的 enabled 不为 1（要求默认开机自启）"
+            exit 1
+          fi
+          if [ "$ADG_REDIR" != "none" ]; then
+            echo "::error::AdGuardHome 预置 config 的 redirect 不为 none（要求默认不启用重定向）"
             exit 1
           fi
           if [ "$ADG_FILTER_N" != "2" ]; then
@@ -920,18 +928,38 @@ jobs:
           FW_F="$IW/files/etc/config/firewall"
           FW_SW="$(sed -n "s/^[[:space:]]*option[[:space:]]\+flow_offloading[[:space:]]\+'\{0,1\}\([01]\)'\{0,1\}[[:space:]]*$/\\1/p" "$FW_F" | head -1)"
           FW_HW="$(sed -n "s/^[[:space:]]*option[[:space:]]\+flow_offloading_hw[[:space:]]\+'\{0,1\}\([01]\)'\{0,1\}[[:space:]]*$/\\1/p" "$FW_F" | head -1)"
-          echo "firewall 预置：flow_offloading=${FW_SW} flow_offloading_hw=${FW_HW}"
-          if [ "$FW_SW" != "1" ] || [ "$FW_HW" != "0" ]; then
+          FW_FC="$(sed -n "s/^[[:space:]]*option[[:space:]]\+fullcone[[:space:]]\+'\{0,1\}\([01]\)'\{0,1\}[[:space:]]*$/\\1/p" "$FW_F" | head -1)"
+          echo "firewall 预置：flow_offloading=${FW_SW} flow_offloading_hw=${FW_HW} fullcone=${FW_FC}"
+          if [ "$FW_SW" != "1" ] || [ "$FW_HW" != "0" ] || [ "$FW_FC" != "1" ]; then
             echo "==================== 预置配置内容校验失败 ===================="
-            echo "定制项       : 防火墙路由/NAT 卸载默认值（软件卸载）"
+            echo "定制项       : 防火墙路由/NAT 卸载默认值（软件卸载 + 全锥 NAT）"
             echo "来源         : ${PRESET_DIR}/etc/config/firewall"
-            echo "期望值       : flow_offloading=1（软件卸载） flow_offloading_hw=0（硬件卸载关）"
-            echo "实际值       : flow_offloading=${FW_SW} flow_offloading_hw=${FW_HW}"
-            echo "可能原因     : preset/etc/config/firewall 被改动，或 defaults 段丢失这两个选项。"
-            echo "建议修复方向 : 在 config defaults 段内补回 option flow_offloading '1'"
-            echo "               与 option flow_offloading_hw '0'。"
+            echo "期望值       : flow_offloading=1（软件卸载） flow_offloading_hw=0（硬件卸载关） fullcone=1（全锥 NAT）"
+            echo "实际值       : flow_offloading=${FW_SW} flow_offloading_hw=${FW_HW} fullcone=${FW_FC}"
+            echo "可能原因     : preset/etc/config/firewall 被改动，或 defaults 段丢失这些选项。"
+            echo "建议修复方向 : 在 config defaults 段内补回 option flow_offloading '1'、"
+            echo "               option flow_offloading_hw '0' 与 option fullcone '1'。"
             echo "==============================================================="
-            echo "::error::firewall 预置配置未默认软件流量卸载"
+            echo "::error::firewall 预置配置未默认软件流量卸载/全锥 NAT"
+            exit 1
+          fi
+
+          #   argon：登录界面在线壁纸必须为 bing（展示 Bing 每日图片）。
+          #   luci-theme-argon 基础主题默认在线壁纸为 'none'，会覆盖
+          #   luci-app-argon-config 的 'bing'，因此本 preset 显式覆盖为 'bing'。
+          ARGON_F="$IW/files/etc/config/argon"
+          ARGON_WP="$(sed -n "s/^[[:space:]]*option[[:space:]]\+online_wallpaper[[:space:]]\+'\\([a-z]*\\)'.*/\\1/p" "$ARGON_F" | head -1)"
+          echo "argon 预置：online_wallpaper=${ARGON_WP}"
+          if [ "$ARGON_WP" != "bing" ]; then
+            echo "==================== 预置配置内容校验失败 ===================="
+            echo "定制项       : argon 主题登录界面在线壁纸（Bing 每日图片）"
+            echo "来源         : ${PRESET_DIR}/etc/config/argon"
+            echo "期望值       : online_wallpaper=bing"
+            echo "实际值       : online_wallpaper=${ARGON_WP}"
+            echo "可能原因     : preset/etc/config/argon 被改动，online_wallpaper 不是 bing。"
+            echo "建议修复方向 : 在 config global 段内补回 option online_wallpaper 'bing'。"
+            echo "==============================================================="
+            echo "::error::argon 预置配置未默认展示 Bing 每日图片"
             exit 1
           fi
 
