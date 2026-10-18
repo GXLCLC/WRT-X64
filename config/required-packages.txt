@@ -18,8 +18,9 @@ ddnsto
 luci-app-ddnsto
 luci-i18n-ddnsto-zh-cn
 
-# ---- 3. AdGuardHome（LuCI 面板 + 核心二进制预置于 files/usr/bin/AdGuardHome） ----
+# ---- 3. AdGuardHome（官方源：luci-app-adguardhome + adguardhome 核心，二进制另预置于 files/usr/bin/AdGuardHome） ----
 luci-app-adguardhome
+adguardhome
 
 # ---- 4. OAF 应用过滤 ----
 luci-app-oaf

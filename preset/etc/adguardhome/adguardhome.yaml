@@ -1,6 +1,7 @@
 # ---------------------------------------------------------------------------
-# 本文件由 WRT-X64 云编译工作流预置，整文件覆盖 luci-app-adguardhome
-# 包自带的 /etc/AdGuardHome.yaml（路径由 UCI 选项 configpath 指定）。
+# 本文件由 WRT-X64 云编译工作流预置，整文件覆盖 ImmortalWrt 官方
+# adguardhome 包的配置（路径由 /etc/config/adguardhome 的 config_file
+# 选项指定，默认为 /etc/adguardhome/adguardhome.yaml）。
 #
 # 相对上游默认值的改动（仅此两处）：
 #   1) dns.upstream_dns：上游 DNS 服务器预填
@@ -9,8 +10,9 @@
 #        ① AD 命中率最高列表  https://anti-ad.net/adguard.txt
 #        ② 海哥的清单         https://gh-proxy.com/https://raw.githubusercontent.com/2771936993/HG/main/hg1.txt
 #
-# 说明：AdGuardHome 默认不启用（见 /etc/config/AdGuardHome 的 enabled=0），
-#       本文件在用户手动启用 AdGuardHome 时被读取。
+# 说明：AdGuardHome 默认开机自启（见 /etc/config/adguardhome 的 enabled=1），
+#       DNS 监听 5553 端口（dns.port），Web 后台监听 3000 端口（bind_port）。
+#       本文件在首次启动时被 init 脚本读取。
 # ---------------------------------------------------------------------------
 bind_host: 0.0.0.0
 bind_port: 3000

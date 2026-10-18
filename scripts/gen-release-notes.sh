@@ -28,17 +28,24 @@ MANIFEST="$(find "$BIN_DIR" -maxdepth 1 -type f -name '*.manifest' | sort | head
 PROFILES_JSON="$BIN_DIR/profiles.json"
 
 # ---------- 内核版本 ----------
-# manifest 中形如 "kernel - 6.6.157-1-<短哈希>"，这里只取 X.Y.Z 部分
+# manifest 中形如 "kernel - 6.12.112-1-<短哈希>"，这里只取 X.Y.Z 部分
 KERNEL_VER=""
 if [ -n "${MANIFEST:-}" ] && [ -f "$MANIFEST" ]; then
 	KERNEL_VER="$(sed -n 's/^kernel[[:space:]]*-[[:space:]]*\([0-9][0-9.]*\).*/\1/p' "$MANIFEST" | head -1)"
 fi
 if [ -z "$KERNEL_VER" ]; then
-	# 兜底：从源码 include/kernel-<patchver> 中解析
+	# 兜底：从源码 target/linux/generic/kernel-<patchver> 中解析
+	# （25.12 起内核版本文件位于 target/linux/generic/，24.10 及以前的
+	#   include/kernel-<patchver> 路径已不存在；文件格式为
+	#   "LINUX_VERSION-6.12 = .112"，值可能带前导点）
 	KPATCH="$(sed -n 's/^KERNEL_PATCHVER:=\(.*\)$/\1/p' "$SRC_DIR/target/linux/x86/Makefile" | tr -d ' \r')"
-	if [ -n "$KPATCH" ] && [ -f "$SRC_DIR/include/kernel-$KPATCH" ]; then
-		KSUF="$(grep -m1 -E "^LINUX_VERSION-$KPATCH[ \t]*=" "$SRC_DIR/include/kernel-$KPATCH" | sed 's/.*=[ \t]*//' | tr -d ' \r')"
-		KERNEL_VER="${KPATCH}${KSUF}"
+	if [ -n "$KPATCH" ] && [ -f "$SRC_DIR/target/linux/generic/kernel-$KPATCH" ]; then
+		KSUF="$(grep -m1 -E "^LINUX_VERSION-${KPATCH}[[:space:]]*=" "$SRC_DIR/target/linux/generic/kernel-$KPATCH" | sed 's/.*=[[:space:]]*//' | tr -d ' \r')"
+		case "$KSUF" in
+		"$KPATCH"*) KERNEL_VER="$KSUF" ;;
+		.*) KERNEL_VER="${KPATCH}${KSUF}" ;;
+		*) [ -n "$KSUF" ] && KERNEL_VER="${KPATCH}.${KSUF}" || KERNEL_VER="" ;;
+		esac
 	fi
 fi
 KERNEL_VER="${KERNEL_VER:-未知}"
@@ -53,7 +60,7 @@ fi
 if [ -z "$FW_VER" ]; then
 	FW_VER="$(awk -F'VERSION_NUMBER),' '/VERSION_NUMBER:.*VERSION_NUMBER),/ {print $2}' "$SRC_DIR/include/version.mk" 2>/dev/null | tr -d ')' | tr -d ' \r' | head -1)"
 fi
-FW_VER="${FW_VER:-24.10-SNAPSHOT}"
+FW_VER="${FW_VER:-25.12-SNAPSHOT}"
 if [ -z "$FW_CODE" ]; then
 	FW_CODE="$(git -C "$SRC_DIR" rev-parse --short HEAD 2>/dev/null || echo '')"
 fi
@@ -115,7 +122,7 @@ BUILD_TIME="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 {
 	echo "# ImmortalWrt X86_64 固件（${TAG}）"
 	echo ""
-	echo "> 源码分支：\`immortalwrt/immortalwrt @ openwrt-24.10\`"
+	echo "> 源码分支：\`immortalwrt/immortalwrt @ openwrt-25.12\`"
 	echo "> 源码提交：\`${SOURCE_SHA}\`"
 	echo "> 编译时间：${BUILD_TIME}"
 	echo ""

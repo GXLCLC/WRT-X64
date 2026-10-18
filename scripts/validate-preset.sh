@@ -83,28 +83,48 @@ for IP in '114.114.114.114' '223.5.5.5' '180.184.1.1' '119.29.29.29' '8.8.8.8'; 
 	fi
 done
 
-# --- AdGuardHome：enabled=1（开机自启）、redirect=none、黑名单恰好 2 条 ---
-ADG_CFG="$FILES_ROOT/etc/config/AdGuardHome"
+# --- AdGuardHome：官方 schema —— enabled=1（开机自启）、config_file 指向预置 YAML、黑名单恰好 2 条 ---
+# 2026-10 起 AGH 改由 ImmortalWrt 官方源提供（immortalwrt/packages 的 net/adguardhome），
+# UCI 配置文件为 /etc/config/adguardhome（小写，段名 config adguardhome 'config'），
+# 不再有第三方版（kenzok8）的 redirect / httpport / binpath 等选项。
+ADG_CFG="$FILES_ROOT/etc/config/adguardhome"
 ADG_ENABLED="$(sed -n "s/^[[:space:]]*option enabled '\([01]\)'.*/\1/p" "$ADG_CFG" | head -1)"
-ADG_REDIR="$(sed -n "s/^[[:space:]]*option redirect '\([a-z]*\)'.*/\1/p" "$ADG_CFG" | head -1)"
-ADG_YAML="$FILES_ROOT/etc/AdGuardHome.yaml"
+ADG_CFGFILE="$(sed -n "s/^[[:space:]]*option config_file '\([^']*\)'.*/\1/p" "$ADG_CFG" | head -1)"
+ADG_YAML="$FILES_ROOT/etc/adguardhome/adguardhome.yaml"
 ADG_FILTER_N="$(grep -cE '^[[:space:]]+-[[:space:]]+enabled:' "$ADG_YAML" || true)"
-echo "AdGuardHome 预置：enabled=${ADG_ENABLED} redirect=${ADG_REDIR} filters=${ADG_FILTER_N}"
+echo "AdGuardHome 预置：enabled=${ADG_ENABLED} config_file=${ADG_CFGFILE} filters=${ADG_FILTER_N}"
 if [ "$ADG_ENABLED" != "1" ]; then
+	echo "==================== 预置配置内容校验失败 ===================="
+	echo "定制项       : AdGuardHome 默认配置（官方源 schema，enabled=1 默认开机自启）"
+	echo "来源         : ${PRESET_DIR}/etc/config/adguardhome"
+	echo "期望值       : enabled=1"
+	echo "实际值       : enabled=${ADG_ENABLED}"
+	echo "可能原因     : preset/etc/config/adguardhome 被改动，enabled 丢失或写错。"
+	echo "建议修复方向 : 在 config adguardhome 'config' 段内补回 option enabled '1'。"
+	echo "==============================================================="
 	echo "::error::AdGuardHome 预置 config 的 enabled 不为 1（要求默认开机自启）"
 	exit 1
 fi
-if [ "$ADG_REDIR" != "none" ]; then
-	echo "::error::AdGuardHome 预置 config 的 redirect 不为 none（要求默认不启用重定向）"
+if [ "$ADG_CFGFILE" != "/etc/adguardhome/adguardhome.yaml" ]; then
+	echo "==================== 预置配置内容校验失败 ===================="
+	echo "定制项       : AdGuardHome 配置文件路径（须与 preset 的 YAML 落位一致）"
+	echo "来源         : ${PRESET_DIR}/etc/config/adguardhome"
+	echo "期望值       : config_file=/etc/adguardhome/adguardhome.yaml"
+	echo "实际值       : config_file=${ADG_CFGFILE}"
+	echo "可能原因     : config_file 选项被改动，或 preset/etc/adguardhome/adguardhome.yaml 未落位。"
+	echo "建议修复方向 : 保持 config adguardhome 'config' 段内"
+	echo "               option config_file '/etc/adguardhome/adguardhome.yaml'。"
+	echo "==============================================================="
+	echo "::error::AdGuardHome 预置 config 的 config_file 路径不符"
 	exit 1
 fi
 if [ "$ADG_FILTER_N" != "2" ]; then
 	echo "==================== 预置配置内容校验失败 ===================="
 	echo "定制项       : AdGuardHome DNS 黑名单清单（仅保留 2 条）"
-	echo "来源         : ${PRESET_DIR}/etc/AdGuardHome.yaml"
+	echo "来源         : ${PRESET_DIR}/etc/adguardhome/adguardhome.yaml"
 	echo "期望值       : filters 条目数 = 2"
 	echo "实际值       : ${ADG_FILTER_N}"
-	echo "可能原因     : preset/etc/AdGuardHome.yaml 的 filters 段被改动。"
+	echo "可能原因     : preset/etc/adguardhome/adguardhome.yaml 的 filters 段被改动。"
 	echo "建议修复方向 : 只保留 https://anti-ad.net/adguard.txt 与"
 	echo "               https://gh-proxy.com/https://raw.githubusercontent.com/2771936993/HG/main/hg1.txt。"
 	echo "==============================================================="
@@ -129,7 +149,7 @@ DHCP_CFG_N="$(grep -cE "^config[[:space:]]+dnsmasq" "$DHCP_F" || true)"
 echo "dhcp 预置：dnsmasq 段=${DHCP_CFG_N} port=53 声明数=${DHCP_PORT_N}"
 if [ "$DHCP_CFG_N" != "1" ] || [ "$DHCP_PORT_N" != "1" ]; then
 	echo "==================== 预置配置内容校验失败 ===================="
-	echo "定制项       : dnsmasq DNS 端口基准（修复 AdGuardHome 重定向失效）"
+	echo "定制项       : dnsmasq DNS 端口基准值（固化 53 端口，与 AGH 的 5553 分工明确）"
 	echo "来源         : ${PRESET_DIR}/etc/config/dhcp"
 	echo "期望值       : config dnsmasq 段 = 1 且 option port '53' 声明 = 1"
 	echo "实际值       : dnsmasq 段=${DHCP_CFG_N} port=53 声明数=${DHCP_PORT_N}"
@@ -140,7 +160,7 @@ if [ "$DHCP_CFG_N" != "1" ] || [ "$DHCP_PORT_N" != "1" ]; then
 	exit 1
 fi
 
-# --- opkg 软件源：6 个 src/gz 源且 URL 指向 24.10 发布目录 ---
+# --- opkg 软件源：6 个 src/gz 源且 URL 指向 25.12 发布目录 ---
 FEEDS_F="$FILES_ROOT/etc/opkg/distfeeds.conf"
 FEEDS_N="$(grep -cE '^[[:space:]]*src/gz[[:space:]]' "$FEEDS_F" || true)"
 echo "opkg distfeeds 预置：src/gz 源数量=${FEEDS_N}"
@@ -152,18 +172,18 @@ if [ "$FEEDS_N" != "6" ]; then
 	echo "实际值       : ${FEEDS_N}"
 	echo "可能原因     : preset/etc/opkg/distfeeds.conf 被改动，源条目增减或被注释。"
 	echo "建议修复方向 : 保持 6 条 src/gz 行，URL 指向"
-	echo "               https://downloads.immortalwrt.org/releases/24.10.0/... 。"
+	echo "               https://downloads.immortalwrt.org/releases/25.12.2/... 。"
 	echo "==============================================================="
 	echo "::error::opkg distfeeds 预置配置源数量不符"
 	exit 1
 fi
 for FEED in \
-	'src/gz immortalwrt_core https://downloads.immortalwrt.org/releases/24.10.0/targets/x86/64/packages' \
-	'src/gz immortalwrt_base https://downloads.immortalwrt.org/releases/24.10.0/packages/x86_64/base' \
-	'src/gz immortalwrt_luci https://downloads.immortalwrt.org/releases/24.10.0/packages/x86_64/luci' \
-	'src/gz immortalwrt_packages https://downloads.immortalwrt.org/releases/24.10.0/packages/x86_64/packages' \
-	'src/gz immortalwrt_routing https://downloads.immortalwrt.org/releases/24.10.0/packages/x86_64/routing' \
-	'src/gz immortalwrt_telephony https://downloads.immortalwrt.org/releases/24.10.0/packages/x86_64/telephony'; do
+	'src/gz immortalwrt_core https://downloads.immortalwrt.org/releases/25.12.2/targets/x86/64/packages' \
+	'src/gz immortalwrt_base https://downloads.immortalwrt.org/releases/25.12.2/packages/x86_64/base' \
+	'src/gz immortalwrt_luci https://downloads.immortalwrt.org/releases/25.12.2/packages/x86_64/luci' \
+	'src/gz immortalwrt_packages https://downloads.immortalwrt.org/releases/25.12.2/packages/x86_64/packages' \
+	'src/gz immortalwrt_routing https://downloads.immortalwrt.org/releases/25.12.2/packages/x86_64/routing' \
+	'src/gz immortalwrt_telephony https://downloads.immortalwrt.org/releases/25.12.2/packages/x86_64/telephony'; do
 	if ! grep -qF "$FEED" "$FEEDS_F"; then
 		echo "::error::opkg distfeeds 预置内容缺失：$FEED"
 		exit 1

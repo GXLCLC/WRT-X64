@@ -5,7 +5,9 @@
 #
 # 核心约束（与需求一一对应）：
 #   1. 仅 workflow_dispatch 手动触发，无 push / schedule 自动触发
-#   2. 源码固定 immortalwrt/immortalwrt 的 openwrt-24.10 分支
+#   2. 源码固定 immortalwrt/immortalwrt 的 openwrt-25.12 分支（2026-10 升级：
+#      原 openwrt-24.10 全部作废；25.12 基于 Linux 6.12 内核，包管理体系为
+#      apk（CONFIG_USE_APK 默认开启，仍向后兼容生成 opkg distfeeds.conf））
 #   3. 编译环境固定 Ubuntu 24.04 LTS（ubuntu-24.04）
 #   4. 仅编译 X86_64 架构，仅产出 squashfs-combined.img（overlay 分区 2048 MiB）
 #   5. 时区 Asia/Shanghai、argon 为默认主题
@@ -47,7 +49,7 @@ permissions:
 # =============================================================================
 env:
   SOURCE_REPO: https://github.com/immortalwrt/immortalwrt.git
-  SOURCE_BRANCH: openwrt-24.10
+  SOURCE_BRANCH: openwrt-25.12
   SRC_DIR: immortalwrt
   KENZOK8_PACKAGES: https://github.com/kenzok8/openwrt-packages.git
   KENZOK8_PACKAGES_BRANCH: master
@@ -161,10 +163,10 @@ jobs:
 
       # ---------------------------------------------------------------------
       # 步骤 5：拉取 ImmortalWrt 官方源码
-      #   目的：固定使用 openwrt-24.10 分支的官方源码作为编译基线。
+      #   目的：固定使用 openwrt-25.12 分支的官方源码作为编译基线。
       #         先校验分支可达性，再浅克隆；分支不存在则立即终止并输出定位信息。
       # ---------------------------------------------------------------------
-      - name: 步骤 5 - 拉取 ImmortalWrt 源码（openwrt-24.10）
+      - name: 步骤 5 - 拉取 ImmortalWrt 源码（openwrt-25.12）
         run: |
           set -euo pipefail
           SRC_DIR="${{ env.SRC_DIR }}"
@@ -187,7 +189,7 @@ jobs:
             exit 1
           fi
 
-          # 浅克隆：只需要 openwrt-24.10 分支的最新一次提交，节省时间与空间
+          # 浅克隆：只需要 openwrt-25.12 分支的最新一次提交，节省时间与空间
           git clone --depth 1 --branch "${{ env.SOURCE_BRANCH }}" \
             "${{ env.SOURCE_REPO }}" "$SRC_DIR"
 
@@ -201,7 +203,10 @@ jobs:
       # 步骤 6：更新并安装软件包源（feeds）
       #   目的：拉取并安装 ImmortalWrt 自带的 packages / luci / routing / telephony
       #         等 feed，优先使用源码自带软件包，减少第三方依赖。
-      #   说明：feeds.conf 中 src-git 即为浅克隆，无需额外优化。
+      #   说明：25.12 的 feeds.conf.default 指向 immortalwrt/packages 与
+      #         immortalwrt/luci（均为 openwrt-25.12 分支），routing/telephony/video
+      #         仍为 openwrt 官方仓库 openwrt-25.12 分支，由脚本自动拉取，无需干预。
+      #         feeds.conf 中 src-git 即为浅克隆，无需额外优化。
       # ---------------------------------------------------------------------
       - name: 步骤 6 - 更新并安装软件包源（feeds）
         working-directory: immortalwrt
@@ -295,7 +300,7 @@ jobs:
               if [ ! -e "${dir}/${q}" ]; then
                 fail_pull "$plugin" "目标路径存在性校验" "$repo" \
                   "${branch}:${q} 存在" "${q} 未检出" \
-                  "上游目录被重命名/移动，或该包未适配 openwrt-24.10" \
+                  "上游目录被重命名/移动，或该包未适配 openwrt-25.12" \
                   "访问 ${repo}/tree/${branch}/${q} 确认路径后同步修改本步骤"
               fi
             done
@@ -306,12 +311,23 @@ jobs:
 
           mkdir -p "$IW/package"
 
-          # ---- 7.1 luci-app-adguardhome（kenzok8/openwrt-packages） ----
-          # LuCI 前端 + 中文文案内置；AdGuardHome 核心二进制在步骤 9 预置。
-          d="$(sparse_pull "luci-app-adguardhome" "${{ env.KENZOK8_PACKAGES }}" \
-                "${{ env.KENZOK8_PACKAGES_BRANCH }}" adg luci-app-adguardhome)"
-          rm -rf "$IW/package/luci-app-adguardhome"
-          cp -rf "$d/luci-app-adguardhome" "$IW/package/luci-app-adguardhome"
+          # ---- 7.1 AdGuardHome：不再从第三方拉取，改由 ImmortalWrt 官方源提供 ----
+          # 来源策略（用户明确要求）：
+          #   优先拉取 ImmortalWrt 源的 AdGuardHome。经 API 核实，
+          #   ImmortalWrt 25.12 官方 feeds 已收录 AdGuardHome：
+          #     - immortalwrt/packages @ openwrt-25.12 : net/adguardhome（v0.107.79）
+          #     - immortalwrt/luci     @ openwrt-25.12 : applications/luci-app-adguardhome
+          #   两者随步骤 6 的 feeds update/install 自动进入源码树
+          #   （package/feeds/packages/adguardhome 与
+          #    package/feeds/luci/luci-app-adguardhome），
+          #   由 config/X86_64.config 显式选中，无需第三方稀疏拉取。
+          #   （24.10 时代官方 feeds 无此包，曾回退 kenzok8/openwrt-packages；
+          #    25.12 起该回退不再需要。）
+          # AdGuardHome 核心二进制由步骤 9 预置到 files/usr/bin/AdGuardHome
+          #   （版本 0.107.79，与官方包一致；files/ 覆盖层优先级更高）。
+          # 官方包的 UCI schema 为 /etc/config/adguardhome（小写），
+          #   预置覆盖见 preset/etc/config/adguardhome 与
+          #   preset/etc/adguardhome/adguardhome.yaml。
 
           # ---- 7.2 ddnsto + luci-app-ddnsto（含 zh-cn 语言包） ----
           d="$(sparse_pull "ddnsto/luci-app-ddnsto" "${{ env.KENZOK8_PACKAGES }}" \
@@ -378,7 +394,10 @@ jobs:
 
           echo ""
           echo "==================== 第三方插件落位结果 ===================="
-          for p in package/luci-app-adguardhome/Makefile \
+          # AdGuardHome 不走第三方拉取，改由官方 feeds 提供（见 7.1 说明），
+          # 这里校验 feeds install 后其符号链接是否就位。
+          for p in package/feeds/packages/adguardhome/Makefile \
+                   package/feeds/luci/luci-app-adguardhome/Makefile \
                    package/ddnsto/Makefile \
                    package/luci-app-ddnsto/Makefile \
                    package/oaf/Makefile \
@@ -474,11 +493,11 @@ jobs:
           rm -rf package/turboacc
           bash /tmp/add_turboacc.sh ${EXTRA}
 
-          # ---- 修复：turboacc 952 补丁与 ImmortalWrt 24.10 原生 952 补丁并存冲突 ----
-          # 背景：ImmortalWrt openwrt-24.10 已原生内置
-          #       target/linux/generic/hack-6.6/952-net-conntrack-events-support-multiple-registrant.patch
+          # ---- 修复：turboacc 952 补丁与 ImmortalWrt 25.12 原生 952 补丁并存冲突 ----
+          # 背景：ImmortalWrt openwrt-25.12 已原生内置
+          #       target/linux/generic/hack-6.12/952-net-conntrack-events-support-multiple-registrant.patch
           #       （功能相同：net: conntrack events, support multiple registrant，
-          #        并已随内核 6.6.157 持续适配）。
+          #        并已随内核 6.12 持续适配）。
           # 而 add_turboacc.sh 只按自己仓库的文件名
           #       952-add-net-conntrack-events-support-multiple-registrant.patch
           #       做存在性删除，不会移除 ImmortalWrt 原生 952 补丁。
@@ -487,8 +506,8 @@ jobs:
           #       7 个 hunk 全部失败 → toolchain/kernel-headers 构建中断。
           # 修复：删除 turboacc 带来的重复补丁，保留 ImmortalWrt 原生版本
           #       （原生版本与源码内核严格匹配，功能完全等价）。
-          TURBOACC_952="target/linux/generic/hack-6.6/952-add-net-conntrack-events-support-multiple-registrant.patch"
-          NATIVE_952="target/linux/generic/hack-6.6/952-net-conntrack-events-support-multiple-registrant.patch"
+          TURBOACC_952="target/linux/generic/hack-6.12/952-add-net-conntrack-events-support-multiple-registrant.patch"
+          NATIVE_952="target/linux/generic/hack-6.12/952-net-conntrack-events-support-multiple-registrant.patch"
           if [ -f "${TURBOACC_952}" ]; then
             echo "检测到 turboacc 注入的重复 952 补丁，已移除（保留 ImmortalWrt 原生版本）：${TURBOACC_952}"
             rm -f "${TURBOACC_952}"
@@ -501,26 +520,26 @@ jobs:
             echo "来源仓库      : ${{ env.SOURCE_REPO }}（分支 ${{ env.SOURCE_BRANCH }}）"
             echo "期望路径      : ${NATIVE_952}"
             echo "实际检测结果  : 文件不存在"
-            echo "可能原因      : 上游 openwrt-24.10 分支调整了 hack-6.6 补丁命名或移除了"
+            echo "可能原因      : 上游 openwrt-25.12 分支调整了 hack-6.12 补丁命名或移除了"
             echo "                952 补丁；此时 turboacc 注入版本与上游内核的适配性未知。"
-            echo "建议修复方向  : 核对上游 hack-6.6 目录实际内容，确认 952 补丁新路径后"
+            echo "建议修复方向  : 核对上游 hack-6.12 目录实际内容，确认 952 补丁新路径后"
             echo "                同步更新 NATIVE_952 与 TURBOACC_952 两个变量。"
             echo "========================================================="
             echo "::error::ImmortalWrt 原生 952 补丁缺失，无法保证 chain events 功能"
             exit 1
           fi
-          # 校验 2：hack-6.6 下不允许同时存在多个 952 系列补丁（防止上游再次改名后冲突复发）
-          COUNT_952="$(find target/linux/generic/hack-6.6 -maxdepth 1 -name '952-*.patch' 2>/dev/null | wc -l)"
+          # 校验 2：hack-6.12 下不允许同时存在多个 952 系列补丁（防止上游再次改名后冲突复发）
+          COUNT_952="$(find target/linux/generic/hack-6.12 -maxdepth 1 -name '952-*.patch' 2>/dev/null | wc -l)"
           if [ "${COUNT_952}" -ne 1 ]; then
             echo "==================== TurboAcc 集成失败 ===================="
             echo "插件 / 组件   : TurboAcc（内核补丁 952 冲突修复）"
             echo "失败阶段      : 补丁唯一性校验"
-            echo "期望结果      : hack-6.6 目录中 952-*.patch 数量 = 1（仅 ImmortalWrt 原生）"
+            echo "期望结果      : hack-6.12 目录中 952-*.patch 数量 = 1（仅 ImmortalWrt 原生）"
             echo "实际检测结果  : ${COUNT_952} 个"
-            echo "当前 952 补丁 : $(ls -1 target/linux/generic/hack-6.6/952-*.patch 2>/dev/null | tr '\n' ' ')"
+            echo "当前 952 补丁 : $(ls -1 target/linux/generic/hack-6.12/952-*.patch 2>/dev/null | tr '\n' ' ')"
             echo "可能原因      : turboacc 又注入了新的 952 补丁变体，或上游原生补丁改名。"
             echo "========================================================="
-            echo "::error::hack-6.6 中存在多个 952 补丁，编译必然冲突"
+            echo "::error::hack-6.12 中存在多个 952 补丁，编译必然冲突"
             exit 1
           fi
           echo "952 补丁冲突修复完成：仅保留 ImmortalWrt 原生版本"
@@ -570,7 +589,13 @@ jobs:
       # 步骤 9：预置 AdGuardHome 核心二进制
       #   目的：满足“完整打包程序核心”的要求。
       #         - AdGuardHome：放入 files/ 覆盖层，随固件打包到 /usr/bin/AdGuardHome，
-      #           LuCI 应用检测到该文件后无需联网下载即可启动。
+      #           这正是官方 adguardhome 包 init 脚本（PROG=/usr/bin/AdGuardHome）
+      #           与 LuCI ACL（exec /usr/bin/AdGuardHome --version）指向的路径。
+      #   与官方包的关系（25.12 起 AGH 改由 ImmortalWrt 官方源提供）：
+      #     官方 net/adguardhome 包会从 Go 源码编译并安装 /usr/bin/AdGuardHome；
+      #     files/ 覆盖层在所有包安装完成之后整体拷入 rootfs，优先级更高，
+      #     因此最终镜像中的核心以这里预置的官方发布页二进制为准
+      #    （版本 0.107.79，与官方包 PKG_VERSION 一致，版本锁定、行为可预期）。
       #   注意：核心与当前固件同为 x86_64，来源为官方发布页。
       #         OpenClash 已按需求移除，其核心不再预置。
       # ---------------------------------------------------------------------
@@ -734,12 +759,16 @@ jobs:
           #   prepare_rootfs）会在所有 ipk 安装完成之后，把源码树顶层 files/
           #   目录整体拷贝进 rootfs，因此这里的预置文件优先级高于软件包自带配置。
           #
-          #   - preset/etc/config/AdGuardHome：enabled=1（默认开机自启，核心已打包，Web 后台可直接访问）、redirect=none（重定向模式由用户手动选）
-          #   - preset/etc/AdGuardHome.yaml  ：上游 DNS 114.114.114.114/223.5.5.5、
-          #                                    黑名单仅保留 anti-ad 与海哥清单两条
+          #   - preset/etc/config/adguardhome：enabled=1（默认开机自启，核心已打包，
+          #                                     Web 后台 3000 端口可直接访问）。
+          #                                     官方 schema：config adguardhome 'config'，
+          #                                     config_file 指向 /etc/adguardhome/adguardhome.yaml
+          #   - preset/etc/adguardhome/adguardhome.yaml：上游 DNS 114.114.114.114/223.5.5.5、
+          #                                     黑名单仅保留 anti-ad 与海哥清单两条
           #   - preset/etc/config/dhcp       ：dnsmasq 段显式写入 option port '53'，
-          #                                    修复 AdGuardHome 重定向模式失效
-          #                                    （其各模式均依赖 uci get dhcp.@dnsmasq[0].port）
+          #                                    固化 DNS 端口基准值（AGH 的 DNS 走 5553，
+          #                                    两者互不冲突；需要 AGH 接管 DNS 时
+          #                                    手动添加 dnsmasq 上游 127.0.0.1#5553）
           #   - preset/etc/opkg/distfeeds.conf：opkg 软件源列表，修复「更新列表」失败
           #                                    （CONFIG_CLEAN_IPKG 开启时上游不再生成该文件）
           #   - preset/etc/config/firewall   ：默认软件流量卸载（硬件卸载对 X86_64 无效）+ 全锥 NAT
@@ -752,8 +781,8 @@ jobs:
             echo "期望路径     : ${PRESET_DIR}"
             echo "实际检测结果 : 目录不存在"
             echo "可能原因     : 检出本仓库时 preset/ 目录缺失（被删除或未被跟踪）。"
-            echo "建议修复方向 : 确认仓库根目录存在 preset/etc/config/{mwan3,smartdns,AdGuardHome,dhcp,firewall}"
-            echo "               preset/etc/opkg/distfeeds.conf 与 preset/etc/AdGuardHome.yaml 并重新提交。"
+            echo "建议修复方向 : 确认仓库根目录存在 preset/etc/config/{mwan3,smartdns,adguardhome,dhcp,firewall,argon}"
+            echo "               preset/etc/opkg/distfeeds.conf 与 preset/etc/adguardhome/adguardhome.yaml 并重新提交。"
             echo "=========================================================="
             echo "::error::未找到 preset/ 目录，无法写入预置配置"
             exit 1
@@ -761,7 +790,7 @@ jobs:
           mkdir -p "$IW/files"
           cp -rf "$PRESET_DIR/." "$IW/files/"
 
-          PRESET_FILES="etc/config/mwan3 etc/config/smartdns etc/config/AdGuardHome etc/AdGuardHome.yaml etc/config/dhcp etc/opkg/distfeeds.conf etc/config/firewall etc/config/argon"
+          PRESET_FILES="etc/config/mwan3 etc/config/smartdns etc/config/adguardhome etc/adguardhome/adguardhome.yaml etc/config/dhcp etc/opkg/distfeeds.conf etc/config/firewall etc/config/argon"
           for f in $PRESET_FILES; do
             if [ ! -s "$IW/files/$f" ]; then
               echo "==================== 预置配置写入失败 ===================="
@@ -797,10 +826,10 @@ jobs:
           #   GitHub Actions 单个 run step 21000 字符的硬上限
           #   （报错 "Exceeded max expression length 21000"，工作流无法被
           #   GitHub 解析，直接 startup_failure），故抽为独立脚本调用。
-          # 脚本内容（逐段）：时区/LAN 兜底、AdGuardHome 核心路径、
-          #   AGH 重定向状态机初始化（old_redirect/old_port/old_enabled）、
-          #   dnsmasq port='53'、防火墙软件流量卸载、opkg 六源兜底、
-          #   mwan3 清空、root 密码。脚本内部自带语法与内容自检。
+          # 脚本内容（逐段）：时区/LAN 兜底、AdGuardHome 开机自启兜底
+          #   （官方 schema：adguardhome.config.enabled=1）、
+          #   dnsmasq port='53'、防火墙软件流量卸载 + 全锥 NAT、argon Bing 图片、
+          #   opkg 六源兜底、mwan3 清空、root 密码。脚本内部自带语法与内容自检。
           bash "$GITHUB_WORKSPACE/scripts/write-uci-defaults.sh" \
             "$IW" "$LAN_IP" "$ROOT_PASSWORD"
           echo "files/ 覆盖层写入完成："
