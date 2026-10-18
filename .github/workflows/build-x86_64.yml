@@ -667,17 +667,37 @@ jobs:
           python3 - "$GEN" <<'PY'
           import io
           import os
+          import re
           import sys
 
           path = sys.argv[1]
           text = io.open(path, encoding="utf-8").read()
           lan_ip = os.environ["LAN_IP"]
 
-          # 默认时区 UTC -> CST-8，并补充 zonename 供 LuCI 时区下拉框显示
-          text = text.replace(
-              "set system.@system[-1].timezone='UTC'",
-              "set system.@system[-1].timezone='CST-8'\n\t\tset system.@system[-1].zonename='Asia/Shanghai'",
+          # 默认时区 UTC/GMT0 -> CST-8，zonename -> Asia/Shanghai
+          # （上游格式随版本变化：24.10 为 timezone='UTC' 且无 zonename 行；
+          #   25.12 为 timezone='GMT0' 且已带 zonename='UTC' 行。
+          #   用正则通吃两种格式；若 zonename 行已存在则原地改写，
+          #   避免追加出第二个 zonename 行被后者（UTC）覆盖前者。）
+          text = re.sub(
+              r"set system\.@system\[-1\]\.timezone='[^']*'",
+              "set system.@system[-1].timezone='CST-8'",
+              text,
+              count=1,
           )
+          if re.search(r"set system\.@system\[-1\]\.zonename='[^']*'", text):
+              text = re.sub(
+                  r"set system\.@system\[-1\]\.zonename='[^']*'",
+                  "set system.@system[-1].zonename='Asia/Shanghai'",
+                  text,
+                  count=1,
+              )
+          else:
+              text = text.replace(
+                  "set system.@system[-1].timezone='CST-8'",
+                  "set system.@system[-1].timezone='CST-8'\n\t\tset system.@system[-1].zonename='Asia/Shanghai'",
+                  1,
+              )
           # NTP 服务器替换为国内可达地址，保证首次开机即可同步时间
           text = text.replace("time.apple.com", "ntp.aliyun.com")
           text = text.replace("time1.google.com", "ntp1.aliyun.com")
