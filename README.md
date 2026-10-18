@@ -104,7 +104,7 @@ argon 的 Bing 壁纸、opkg 六源完整性与 URL），不符合需求立即�
 ## 目录结构
 
 ```
-.github/workflows/build-x86_64.yml   主工作流（22 个步骤，全中文注释）
+.github/workflows/build-x86_64.yml   主工作流（21 个步骤，全中文注释）
 config/X86_64.config                 固件配置基线，增减插件改这里
 config/required-packages.txt         必选软件包清单（编译前后双重校验）
 preset/etc/config/mwan3              mwan3 预置配置（接口/成员/策略留空）
@@ -147,9 +147,9 @@ scripts/validate-preset.sh            预置内容结构化校验（mwan3/SmartD
 | 预置配置 | `preset/` 八个文件落位校验 + 内容结构化校验（由 `scripts/validate-preset.sh` 执行：mwan3 段落计数 = 0/0/0 且规则 = 3；SmartDNS `enabled=0`/`auto_set_dnsmasq=0`/5 个上游且全为 udp、无 port；AdGuardHome `enabled=1`、`config_file` 指向预置 YAML、黑名单恰好 2 条指定链接；dhcp 的 `config dnsmasq` 段含 `option port '53'`；firewall 的 `flow_offloading=1`/`flow_offloading_hw=0`/`fullcone=1`；argon 的 `online_wallpaper=bing`；opkg 恰好 6 个 `src/gz` 源且 URL 指向 25.12.2 发布目录） |
 | 编译前 | `make defconfig` 后必选包解析校验；`make download` 后 0 字节下载文件校验（自动排除 cargo 在 `dl/cargo` 下创建的 `.package-cache` 等天然为空的隐藏锁标记文件，避免误判） |
 | 编译后 | 产物存在性、命名唯一性、MBR 分区表、rootfs 2048 MiB、squashfs 魔数、manifest 插件完整性、AdGuardHome 核心存在 |
-| 压缩发布 | 压缩前磁盘空间充足性 + 压缩产物体积 < 2 GiB（Release 单文件上限），两道校验在步骤 18 与步骤 22 各执行一次 |
+| 压缩发布 | 压缩前磁盘空间充足性 + 压缩产物体积 < 2 GiB（Release 单文件上限），两道校验在步骤 17 与步骤 21 各执行一次 |
 
-编译失败时，工作流会先以 `-j1 V=s` 串行重跑以暴露真实出错包，再上传日志 Artifact（`build.log` / `download.log` / `verify.log`，按实际执行到的阶段收录）。该串行重跑仅在**步骤 15 编译本身失败**时触发；若故障发生在更早的阶段（如步骤 14 源码预下载），则不会重跑编译，以免白耗机时并用一份“编译成功”的日志掩盖真实原因。
+编译失败时，工作流会先以 `-j1 V=s` 串行续建：并行编译失败多见于 25.12 的 `package/install` 高并发竞态（错误输出被并行模式吞掉，只剩 "build failed. Please re-run make with -j1 V=s"），此时串行续建通常数分钟即可完成剩余安装并产出镜像，工作流继续走校验/发布全流程；若为真实编译错误，串行同样失败，且 `V=s` 全量输出会暴露确切出错包，步骤以失败告终（严格模式不被削弱）。随后上传日志 Artifact（`build.log` / `download.log` / `verify.log`，按实际执行到的阶段收录）。
 
 ## 第三方插件来源
 

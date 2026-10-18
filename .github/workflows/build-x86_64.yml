@@ -939,7 +939,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 下载阶段的完整输出落盘为 download.log，失败时由步骤 20 上传
+          # 下载阶段的完整输出落盘为 download.log，失败时由步骤 19 上传
           DL_LOG="$GITHUB_WORKSPACE/download.log"
           : > "$DL_LOG"
 
@@ -993,12 +993,23 @@ jobs:
           fi
 
       # ---------------------------------------------------------------------
-      # 步骤 15：编译固件（严格模式）
+      # 步骤 15：编译固件（严格模式 + 串行续建回退）
       #   目的：正式编译镜像。
       #   严格模式说明：
       #     - 不传 -k，make 遇到第一个错误即退出，不会继续编译其余软件包；
       #     - 显式覆盖 IGNORE_ERRORS= 为空，杜绝“忽略错误继续编”的行为；
       #     - 全程 tee 到 build.log，便于失败时上传完整日志。
+      #   串行续建回退（25.12 实测新增，必修）：
+      #     - 背景：run 39120232147 实证，-j4 并行编译在 package/install（暂存区
+      #       安装）阶段会发生非确定性竞态失败——所有包均编译完成，错误输出却被
+      #       toplevel.mk 的并行模式吞掉（只剩 "build failed. Please re-run make
+      #       with -j1 V=s"），而随后的 -j1 串行重跑仅用 6 分钟即续建成功并产出
+      #       完整镜像（openssl/ca-certificates 等仅缺安装步骤，编译为 no-op）。
+      #     - 策略：并行编译一旦失败，立即以 -j1 V=s 串行重跑续建：
+      #         · 竞态类失败 → 串行续建成功，工作流继续走产物校验/发布全流程；
+      #         · 真实编译错误 → 串行同样失败，且 V=s 全量输出暴露确切出错包，
+      #           步骤以失败告终（严格模式不被削弱）。
+      #     - 续建只重做未完成的部分（已 stamp 的包不重编译），时间代价小。
       # ---------------------------------------------------------------------
       - name: 步骤 15 - 编译固件（严格模式，任一包失败立即终止）
         id: build
@@ -1006,31 +1017,17 @@ jobs:
         run: |
           set -o pipefail
           echo "开始编译：$(date '+%F %T')，并行度 $(nproc)"
-          make -j"$(nproc)" IGNORE_ERRORS= 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          if make -j"$(nproc)" IGNORE_ERRORS= 2>&1 | tee "$GITHUB_WORKSPACE/build.log"; then
+            echo "并行编译成功：$(date '+%F %T')"
+          else
+            echo "::warning::并行编译失败（25.12 下多见于 package/install 高并发竞态），转入 -j1 V=s 串行续建"
+            echo "==================== 并行编译失败，进入 -j1 V=s 串行续建 ====================" >> "$GITHUB_WORKSPACE/build.log"
+            make -j1 V=s IGNORE_ERRORS= 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
+          fi
           echo "编译结束：$(date '+%F %T')"
 
       # ---------------------------------------------------------------------
-      # 步骤 16：编译失败时串行重跑以定位错误
-      #   目的：并行编译的报错信息会交错，难以定位。失败后以 -j1 V=s 重新执行，
-      #         输出真正出错的软件包与完整编译命令，追加写入同一份 build.log。
-      #   说明：该步骤一定不会让工作流“变成成功”，仅用于补充日志。
-      #   条件：仅当“步骤 15 本身失败”时才重跑。
-      #         若步骤 15 根本没执行（例如前面的步骤 14 失败导致其被跳过），
-      #         这里再跑一遍完整串行编译毫无意义 —— 既白耗约 1.5 小时机时，
-      #         又会产出一份“编译其实成功”的日志，把真正的故障原因掩盖掉。
-      # ---------------------------------------------------------------------
-      - name: 步骤 16 - 编译失败时串行重跑以定位错误
-        if: failure() && steps.build.outcome == 'failure'
-        continue-on-error: true
-        working-directory: immortalwrt
-        run: |
-          set -o pipefail
-          echo "==================== 进入失败复现（-j1 V=s） ===================="
-          make -j1 V=s IGNORE_ERRORS= 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log" || true
-          echo "==================== 失败复现结束 ==============================="
-
-      # ---------------------------------------------------------------------
-      # 步骤 17：校验编译产物
+      # 步骤 16：校验编译产物
       #   目的：按需求逐项确认产物正确：
       #         - 文件存在性与命名：*-squashfs-combined.img
       #         - 镜像格式：rootfs 分区起始为 squashfs 魔数 hsqs
@@ -1038,7 +1035,7 @@ jobs:
       #         - 插件完整性：必选包全部出现在固件 manifest 中
       #   任一项不通过即终止工作流，并输出检测命令/期望值/实际值/可能原因。
       # ---------------------------------------------------------------------
-      - name: 步骤 17 - 校验编译产物（存在性/命名/格式/分区/插件完整性）
+      - name: 步骤 16 - 校验编译产物（存在性/命名/格式/分区/插件完整性）
         id: verify
         run: |
           set -o pipefail
@@ -1053,19 +1050,19 @@ jobs:
           echo "image_name=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
 
       # ---------------------------------------------------------------------
-      # 步骤 18：压缩固件为 img.gz
+      # 步骤 17：压缩固件为 img.gz
       #   目的：2G overlay 使原始 squashfs-combined.img 约 2.2 GiB，
       #         超过 GitHub Release 单文件 2 GiB 硬上限
       #         （HTTP 422 size must be less than 2147483648）。
       #         这里用 gzip -9 压缩后再发布，上传体积通常降到 ~200 MiB。
       #   说明：rootfs 分区由 gen_image_generic.sh 用 dd if=/dev/zero 填充，
       #         2 GiB 分区中除 squashfs 实际数据外全为零字节，压缩率极高。
-      #         原始 .img 保留在原地，供步骤 17 已完成的分区/魔数校验追溯。
+      #         原始 .img 保留在原地，供步骤 16 已完成的分区/魔数校验追溯。
       #   注意：此处不使用 OpenWrt 内置的 CONFIG_TARGET_IMAGES_GZIP，
       #         因为该开关在 x86 image/Makefile 中是 if/else 互斥的——
       #         开启后只产出 .img.gz 而不再产出 .img，会使产物校验失去依据。
       # ---------------------------------------------------------------------
-      - name: 步骤 18 - 压缩固件为 img.gz（规避 Release 单文件 2GiB 上限）
+      - name: 步骤 17 - 压缩固件为 img.gz（规避 Release 单文件 2GiB 上限）
         id: pack
         if: success()
         env:
@@ -1155,11 +1152,11 @@ jobs:
           echo "gz_size=${GZ_SIZE}" >> "$GITHUB_OUTPUT"
 
       # ---------------------------------------------------------------------
-      # 步骤 19：上传固件 Artifact
+      # 步骤 18：上传固件 Artifact
       #   目的：便于在 Actions 页面直接下载固件（可选，不影响 Release 内容）。
       #         上传压缩后的 .img.gz，避免 Artifact 体积过大。
       # ---------------------------------------------------------------------
-      - name: 步骤 19 - 上传固件 Artifact
+      - name: 步骤 18 - 上传固件 Artifact
         if: success() && inputs.upload_artifact
         uses: actions/upload-artifact@v4
         with:
@@ -1168,16 +1165,16 @@ jobs:
           if-no-files-found: error
 
       # ---------------------------------------------------------------------
-      # 步骤 20：失败时上传完整日志
+      # 步骤 19：失败时上传完整日志
       #   目的：需求要求编译失败必须上传完整日志用于排查错误与 Bug。
       #   收录内容：
       #     build.log    —— 步骤 15/16 的完整编译日志（若编译阶段未执行则不存在）
       #     download.log —— 步骤 14 的源码预下载日志（若失败在下载阶段，靠它排查）
-      #     verify.log   —— 步骤 17 的产物校验日志（若该步骤未执行则不存在）
+      #     verify.log   —— 步骤 16 的产物校验日志（若该步骤未执行则不存在）
       #   说明：三个文件都是“按实际发生情况”存在，故使用 if-no-files-found: ignore，
       #         避免某个阶段没跑到时反而让上传步骤本身报错。
       # ---------------------------------------------------------------------
-      - name: 步骤 20 - 失败时上传完整日志（编译/下载/校验）
+      - name: 步骤 19 - 失败时上传完整日志（编译/下载/校验）
         if: failure()
         uses: actions/upload-artifact@v4
         with:
@@ -1189,12 +1186,12 @@ jobs:
           if-no-files-found: ignore
 
       # ---------------------------------------------------------------------
-      # 步骤 21：生成 Release 说明
+      # 步骤 20：生成 Release 说明
       #   目的：自动填充后台登录 IP / 账号 / 密码 / 内核版本 / 固件版本 /
       #         已安装插件清单（仅应用插件，不含 kmod 内核模块驱动）。
       #         因最终发布的是 .img.gz，说明中同步给出解压方法与压缩包 SHA256。
       # ---------------------------------------------------------------------
-      - name: 步骤 21 - 生成 Release 说明（固件信息与插件清单）
+      - name: 步骤 20 - 生成 Release 说明（固件信息与插件清单）
         if: success()
         id: notes
         env:
@@ -1219,14 +1216,14 @@ jobs:
           cat "$GITHUB_WORKSPACE/RELEASE_NOTES.md"
 
       # ---------------------------------------------------------------------
-      # 步骤 22：创建 GitHub Release
+      # 步骤 21：创建 GitHub Release
       #   目的：编译成功后自动发布固件。
       #         仅上传 squashfs-combined.img.gz，过滤其它多余产物
       #         （combined-efi.img、manifest、profiles.json、sha256sums 等均不发布）。
       #   说明：原始 .img 约 2.2 GiB，超过 Release 单文件 2 GiB 上限，
-      #         故发布步骤 18 压缩得到的 .img.gz。
+      #         故发布步骤 17 压缩得到的 .img.gz。
       # ---------------------------------------------------------------------
-      - name: 步骤 22 - 创建 GitHub Release（仅发布 squashfs-combined.img.gz）
+      - name: 步骤 21 - 创建 GitHub Release（仅发布 squashfs-combined.img.gz）
         if: success()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1246,14 +1243,14 @@ jobs:
             echo "产物目录     : ${{ env.SRC_DIR }}/bin/targets/x86/64"
             echo "期望路径     : ${GZ_PATH}"
             echo "实际检测结果 : 文件不存在"
-            echo "可能原因     : 步骤 18 压缩产物在校验之后被移动或删除。"
+            echo "可能原因     : 步骤 17 压缩产物在校验之后被移动或删除。"
             echo "========================================================="
             echo "::error::待发布的固件压缩包不存在：${GZ_PATH}"
             exit 1
           fi
 
           # 前置校验 2：再次确认未超过 Release 单文件 2 GiB 上限
-          #           （步骤 18 已校验，这里兜底，避免上传阶段才报 HTTP 422）
+          #           （步骤 17 已校验，这里兜底，避免上传阶段才报 HTTP 422）
           LIMIT=2147483648
           ACTUAL_SIZE="$(stat -c '%s' "$GZ_PATH")"
           if [ "$ACTUAL_SIZE" -ge "$LIMIT" ]; then
